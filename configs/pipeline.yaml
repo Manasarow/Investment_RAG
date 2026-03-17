@@ -1,0 +1,36 @@
+embedding:
+  model: BAAI/bge-m3
+  dense_dim: 1024
+  batch_size: 64        # RTX 4090 can handle 64 easily
+  device: cuda
+
+qdrant:
+  host: localhost
+  port: 6333
+  collection_name: rag_investment
+
+chunking:
+  prose_max_tokens: 512
+  prose_overlap: 64
+  table_strategy: row_groups
+
+retrieval:
+  dense_top_k: 50
+  sparse_top_k: 50
+  rrf_k: 60
+  reranker_top_k: 10
+  final_context_chunks: 6
+
+generation:
+  model: claude-sonnet-4-20250514
+  max_tokens: 2048
+  temperature: 0
+
+sec:
+  user_agent: "Mana manasarow@gmail.com"   # REPLACE with your real name/email
+  rate_limit_sleep: 0.12
+  date_from: "2023-01-01"
+  forms:
+    - "10-K"
+    - "10-Q"
+    - "8-K"

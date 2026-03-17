@@ -1,1 +1,7 @@
-Folder to store raw and intermediate datasets.
+Folder to store raw and intermediate datasets. 
+
+Folders to create:
+- chunks
+- parsed
+- raw
+- tables

@@ -1,0 +1,51 @@
+ticker,company,cik
+AAPL,Apple Inc.,320193
+MSFT,Microsoft Corporation,789019
+NVDA,NVIDIA Corporation,1045810
+AMZN,Amazon.com Inc.,1018724
+GOOGL,Alphabet Inc.,1652044
+META,Meta Platforms Inc.,1326801
+TSLA,Tesla Inc.,1318605
+BRK-B,Berkshire Hathaway Inc.,1067983
+TSM,Taiwan Semiconductor,1046179
+JPM,JPMorgan Chase & Co.,19617
+V,Visa Inc.,1403161
+UNH,UnitedHealth Group,72971
+XOM,Exxon Mobil Corporation,34088
+MA,Mastercard Incorporated,1141391
+LLY,Eli Lilly and Company,59478
+AVGO,Broadcom Inc.,1730168
+JNJ,Johnson & Johnson,200406
+PG,Procter & Gamble Co.,80424
+HD,The Home Depot Inc.,354950
+COST,Costco Wholesale Corporation,909832
+MRK,Merck & Co. Inc.,310158
+ABBV,AbbVie Inc.,1551152
+CVX,Chevron Corporation,93410
+CRM,Salesforce Inc.,1108524
+AMD,Advanced Micro Devices,2488
+NFLX,Netflix Inc.,1065280
+TMO,Thermo Fisher Scientific,97745
+ACN,Accenture plc,1467373
+LIN,Linde plc,1707092
+MCD,McDonald's Corporation,63754
+BAC,Bank of America Corp,70858
+WMT,Walmart Inc.,104169
+PEP,PepsiCo Inc.,77476
+ORCL,Oracle Corporation,1341439
+CSCO,Cisco Systems Inc.,858877
+ABT,Abbott Laboratories,1800
+GE,GE Aerospace,40533
+TXN,Texas Instruments,97476
+QCOM,QUALCOMM Incorporated,804328
+IBM,IBM Corporation,51143
+NOW,ServiceNow Inc.,1373715
+MS,Morgan Stanley,895421
+GS,Goldman Sachs Group,886982
+INTU,Intuit Inc.,896878
+AMAT,Applied Materials Inc.,796343
+SPGI,S&P Global Inc.,64040
+BLK,BlackRock Inc.,1364742
+CAT,Caterpillar Inc.,18230
+RTX,RTX Corporation,101829
+HON,Honeywell International,773840
