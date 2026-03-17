@@ -1,0 +1,190 @@
+{
+  "retriever_metrics": {
+    "overall": {
+      "recall@5": 0.39444444444444443,
+      "recall@10": 0.42777777777777776,
+      "recall@20": 0.42777777777777776,
+      "precision@5": 0.32666666666666677,
+      "precision@10": 0.3212698412698413,
+      "precision@20": 0.3212698412698413,
+      "f1@5": 0.3444155844155844,
+      "f1@10": 0.3527405927405927,
+      "f1@20": 0.3527405927405927,
+      "ndcg@5": 0.7016744344948898,
+      "ndcg@10": 0.877692687933998,
+      "ndcg@20": 0.877692687933998,
+      "mrr": 0.5222222222222223
+    },
+    "by_bucket": {
+      "single_hop": {
+        "recall@5": 0.7,
+        "recall@10": 0.7,
+        "recall@20": 0.7,
+        "precision@5": 0.64,
+        "precision@10": 0.5904761904761904,
+        "precision@20": 0.5904761904761904,
+        "f1@5": 0.6646464646464647,
+        "f1@10": 0.6369230769230769,
+        "f1@20": 0.6369230769230769,
+        "ndcg@5": 1.5895905908726096,
+        "ndcg@10": 2.006597073753757,
+        "ndcg@20": 2.006597073753757,
+        "mrr": 0.8666666666666668
+      },
+      "multi_hop": {
+        "recall@5": 0.16666666666666666,
+        "recall@10": 0.26666666666666666,
+        "recall@20": 0.26666666666666666,
+        "precision@5": 0.13999999999999999,
+        "precision@10": 0.18,
+        "precision@20": 0.18,
+        "f1@5": 0.13714285714285715,
+        "f1@10": 0.1942857142857143,
+        "f1@20": 0.1942857142857143,
+        "ndcg@5": 0.1770084129401909,
+        "ndcg@10": 0.2880566903763683,
+        "ndcg@20": 0.2880566903763683,
+        "mrr": 0.2
+      },
+      "thematic": {
+        "recall@5": 0.31666666666666665,
+        "recall@10": 0.31666666666666665,
+        "recall@20": 0.31666666666666665,
+        "precision@5": 0.2,
+        "precision@10": 0.19333333333333333,
+        "precision@20": 0.19333333333333333,
+        "f1@5": 0.23145743145743145,
+        "f1@10": 0.22701298701298703,
+        "f1@20": 0.22701298701298703,
+        "ndcg@5": 0.33842429967186866,
+        "ndcg@10": 0.33842429967186866,
+        "ndcg@20": 0.33842429967186866,
+        "mrr": 0.5
+      }
+    }
+  },
+  "generator_metrics": {
+    "overall": {
+      "answer_correctness": 0.4,
+      "faithfulness_proxy": 1.0,
+      "abstention_rate": 0.2,
+      "n": 15
+    },
+    "by_bucket": {
+      "single_hop": {
+        "answer_correctness": 0.8,
+        "faithfulness_proxy": 1.0,
+        "abstention_rate": 0.2,
+        "n": 5
+      },
+      "multi_hop": {
+        "answer_correctness": 0.0,
+        "faithfulness_proxy": 1.0,
+        "abstention_rate": 0.2,
+        "n": 5
+      },
+      "thematic": {
+        "answer_correctness": 0.4,
+        "faithfulness_proxy": 1.0,
+        "abstention_rate": 0.2,
+        "n": 5
+      }
+    }
+  },
+  "citation_metrics": {
+    "citation_accuracy": 0.5833333333333334,
+    "citation_match_rate": 1.0
+  },
+  "ablation_study": [
+    {
+      "variant": "LLM-only (no retrieval)",
+      "n_queries": 15,
+      "answer_correctness": 0.0,
+      "faithfulness": 1.0,
+      "abstention_rate": 1.0,
+      "recall@10": 0.0,
+      "precision@10": 0.0,
+      "ndcg@10": 0.0,
+      "mrr": 0.0,
+      "citation_accuracy": 0.0
+    },
+    {
+      "variant": "Dense-only retrieval",
+      "n_queries": 15,
+      "answer_correctness": 0.13333333333333333,
+      "faithfulness": 1.0,
+      "abstention_rate": 0.5333333333333333,
+      "recall@10": 0.3722222222222223,
+      "precision@10": 0.2033333333333333,
+      "ndcg@10": 0.5504671141115679,
+      "mrr": 0.4,
+      "citation_accuracy": 0.14285714285714285
+    },
+    {
+      "variant": "Sparse-only retrieval",
+      "n_queries": 15,
+      "answer_correctness": 0.13333333333333333,
+      "faithfulness": 1.0,
+      "abstention_rate": 0.4666666666666667,
+      "recall@10": 0.3333333333333333,
+      "precision@10": 0.17777777777777778,
+      "ndcg@10": 0.4413420714022202,
+      "mrr": 0.3416666666666667,
+      "citation_accuracy": 0.25
+    },
+    {
+      "variant": "Hybrid (dense + sparse)",
+      "n_queries": 15,
+      "answer_correctness": 0.2,
+      "faithfulness": 1.0,
+      "abstention_rate": 0.4666666666666667,
+      "recall@10": 0.41111111111111115,
+      "precision@10": 0.19333333333333333,
+      "ndcg@10": 0.4678584526911503,
+      "mrr": 0.33555555555555555,
+      "citation_accuracy": 0.5
+    },
+    {
+      "variant": "Hybrid + Reranker",
+      "n_queries": 15,
+      "answer_correctness": 0.26666666666666666,
+      "faithfulness": 1.0,
+      "abstention_rate": 0.26666666666666666,
+      "recall@10": 0.3611111111111111,
+      "precision@10": 0.2733333333333333,
+      "ndcg@10": 0.6460863123092224,
+      "mrr": 0.4222222222222223,
+      "citation_accuracy": 0.45454545454545453
+    },
+    {
+      "variant": "Hybrid + Reranker + Verifier",
+      "n_queries": 15,
+      "answer_correctness": 0.4,
+      "faithfulness": 1.0,
+      "abstention_rate": 0.2,
+      "recall@10": 0.42777777777777776,
+      "precision@10": 0.3212698412698413,
+      "ndcg@10": 0.877692687933998,
+      "mrr": 0.5222222222222223,
+      "citation_accuracy": 0.5833333333333334
+    },
+    {
+      "variant": "Fixed chunking (512 tokens)",
+      "description": "Requires manual chunker configuration \u2014 run separately",
+      "answer_correctness": null,
+      "faithfulness": null,
+      "recall@10": null,
+      "ndcg@10": null,
+      "citation_accuracy": null
+    },
+    {
+      "variant": "Hierarchical + table-aware",
+      "description": "Requires manual chunker configuration \u2014 run separately",
+      "answer_correctness": null,
+      "faithfulness": null,
+      "recall@10": null,
+      "ndcg@10": null,
+      "citation_accuracy": null
+    }
+  ]
+}

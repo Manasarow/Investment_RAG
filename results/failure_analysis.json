@@ -1,0 +1,98 @@
+{
+  "abstentions": [
+    {
+      "query_id": "sh_005",
+      "query": "What was Microsoft's gross margin percentage in FY2024?",
+      "bucket": "single_hop",
+      "verification": {
+        "has_context": true,
+        "sufficient_chunks": true,
+        "target_company_present": true,
+        "correct_period": true,
+        "correct_form": true
+      }
+    },
+    {
+      "query_id": "mh_003",
+      "query": "Which company had higher revenue in FY2024 \u2014 Amazon or Microsoft?",
+      "bucket": "multi_hop",
+      "verification": {
+        "has_context": true,
+        "sufficient_chunks": true,
+        "all_companies_present": true
+      }
+    },
+    {
+      "query_id": "th_005",
+      "query": "How are financial institutions discussing interest rate risk in their latest filings?",
+      "bucket": "thematic",
+      "verification": {
+        "has_context": true,
+        "sufficient_chunks": true,
+        "company_diversity": true
+      }
+    }
+  ],
+  "wrong_period": [],
+  "hallucination_blocked": [],
+  "citation_miss": [
+    {
+      "query_id": "mh_001",
+      "cited": [
+        32
+      ],
+      "required": [
+        33,
+        23
+      ]
+    },
+    {
+      "query_id": "mh_002",
+      "cited": [
+        26,
+        24
+      ],
+      "required": [
+        25,
+        43,
+        41
+      ]
+    },
+    {
+      "query_id": "mh_004",
+      "cited": [
+        9,
+        70
+      ],
+      "required": [
+        41,
+        30
+      ]
+    },
+    {
+      "query_id": "th_002",
+      "cited": [
+        11,
+        20
+      ],
+      "required": [
+        10,
+        12,
+        15
+      ]
+    },
+    {
+      "query_id": "th_003",
+      "cited": [
+        18
+      ],
+      "required": [
+        33,
+        41,
+        55,
+        23
+      ]
+    }
+  ],
+  "errors": []
+}

@@ -1,0 +1,37 @@
+=================================================================
+EVALUATION RESULTS
+=================================================================
+
+10.2 RETRIEVER METRICS
+────────────────────────────────────────
+  Recall@5:      0.3944
+  Recall@10:     0.4278
+  Recall@20:     0.4278
+  Precision@10:  0.3213
+  F1@10:         0.3527
+  MRR:           0.5222
+  nDCG@10:       0.8777
+
+10.3 GENERATOR METRICS
+────────────────────────────────────────
+  Answer Correctness:  0.4000
+  Faithfulness:        1.0000
+  Abstention Rate:     0.2000
+
+10.4 CITATION METRICS
+────────────────────────────────────────
+  Citation Accuracy:   0.5833
+  Citation Match Rate: 1.0000
+
+10.5 ABLATION STUDY
+────────────────────────────────────────
+Variant                                         Correct   Faith    R@10  nDCG@10  CitAcc
+────────────────────────────────────────────────────────────────────────────────────────
+LLM-only (no retrieval)                           0.000   1.000   0.000    0.000   0.000
+Dense-only retrieval                              0.133   1.000   0.372    0.550   0.143
+Sparse-only retrieval                             0.133   1.000   0.333    0.441   0.250
+Hybrid (dense + sparse)                           0.200   1.000   0.411    0.468   0.500
+Hybrid + Reranker                                 0.267   1.000   0.361    0.646   0.455
+Hybrid + Reranker + Verifier                      0.400   1.000   0.428    0.878   0.583
+Fixed chunking (512 tokens)                         N/A     N/A     N/A      N/A     N/A
+Hierarchical + table-aware                          N/A     N/A     N/A      N/A     N/A
