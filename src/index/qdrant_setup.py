@@ -1,6 +1,6 @@
 """
 Qdrant collection setup for the RAG investment pipeline.
-Safer version: validates existing schema before reuse.
+Validates an existing collection before reusing it.
 """
 
 import logging
@@ -63,11 +63,11 @@ _BOOL_INDEXES = [
 
 
 def get_client() -> QdrantClient:
-    """Return a connected Qdrant client. Retries 3× with backoff on startup."""
+    """Create and verify a Qdrant connection, retrying during startup delays."""
     for attempt in range(3):
         try:
             client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
-            client.get_collections()
+            client.get_collections()  # Confirms the server is reachable.
             return client
         except Exception as e:
             if attempt == 2:
@@ -82,6 +82,7 @@ def get_client() -> QdrantClient:
 
 
 def _expected_vectors_config() -> dict:
+    """Return the expected dense vector configuration for the collection."""
     return {
         "dense": VectorParams(
             size=DENSE_DIM,
@@ -97,6 +98,7 @@ def _expected_vectors_config() -> dict:
 
 
 def _expected_sparse_vectors_config() -> dict:
+    """Return the expected sparse vector configuration."""
     return {
         "sparse": SparseVectorParams(
             index=SparseIndexParams(
@@ -107,6 +109,7 @@ def _expected_sparse_vectors_config() -> dict:
 
 
 def _expected_quantization_config() -> ScalarQuantization:
+    """Return the scalar quantization settings used for storage efficiency."""
     return ScalarQuantization(
         scalar=ScalarQuantizationConfig(
             type=ScalarType.INT8,
@@ -117,6 +120,7 @@ def _expected_quantization_config() -> ScalarQuantization:
 
 
 def _create_collection(client: QdrantClient, collection_name: str) -> None:
+    """Create the collection with the schema required by the pipeline."""
     log.info(f"Creating collection '{collection_name}'…")
     client.create_collection(
         collection_name=collection_name,
@@ -126,17 +130,13 @@ def _create_collection(client: QdrantClient, collection_name: str) -> None:
         on_disk_payload=True,
         optimizers_config=OptimizersConfigDiff(default_segment_number=4),
     )
-    log.info(f"  Collection '{collection_name}' created.")
+    log.info(f"Collection '{collection_name}' created.")
 
 
 def _validate_collection_schema(client: QdrantClient, collection_name: str) -> None:
-    """
-    Raise RuntimeError if the existing collection does not match what the indexer expects.
-    """
+    """Check that an existing collection matches the schema expected by the indexer."""
     info = client.get_collection(collection_name)
-
-    # qdrant-client response structure varies slightly by version, so keep this defensive.
-    params = info.config.params
+    params = info.config.params  # Qdrant config layout can vary slightly by client version.
 
     vector_cfg = getattr(params, "vectors", None)
     sparse_cfg = getattr(params, "sparse_vectors", None)
@@ -149,14 +149,14 @@ def _validate_collection_schema(client: QdrantClient, collection_name: str) -> N
     elif isinstance(vector_cfg, dict):
         dense = vector_cfg.get("dense")
     elif hasattr(vector_cfg, "size"):
-        # single unnamed-vector collection — definitely wrong for this pipeline
-        dense = None
+        dense = None  # A single unnamed vector is incompatible with this pipeline.
 
     if dense is None:
         errors.append("missing named dense vector 'dense'")
     else:
         dense_size = getattr(dense, "size", None)
         dense_distance = getattr(dense, "distance", None)
+
         if dense_size != DENSE_DIM:
             errors.append(f"dense.size={dense_size} != expected {DENSE_DIM}")
         if str(dense_distance).upper() != str(Distance.COSINE).upper():
@@ -189,26 +189,24 @@ def setup_collection(
     recreate: bool = False,
     recreate_on_mismatch: bool = False,
 ) -> QdrantClient:
-    """
-    Create or verify the Qdrant collection with the exact schema the indexer expects.
-    """
+    """Create, validate, or recreate the collection, then ensure payload indexes exist."""
     if client is None:
-        client = get_client()
+        client = get_client()  # Lazily create the client when one is not provided.
 
     existing = {c.name for c in client.get_collections().collections}
 
     if recreate and collection_name in existing:
-        log.warning(f"recreate=True — deleting collection '{collection_name}'")
+        log.warning(f"recreate=True: deleting collection '{collection_name}'")
         client.delete_collection(collection_name)
         existing.discard(collection_name)
 
     if collection_name not in existing:
         _create_collection(client, collection_name)
     else:
-        log.info(f"Collection '{collection_name}' already exists — validating schema…")
+        log.info(f"Collection '{collection_name}' already exists. Validating schema…")
         try:
             _validate_collection_schema(client, collection_name)
-            log.info("  Existing collection schema is compatible.")
+            log.info("Existing collection schema is compatible.")
         except RuntimeError as e:
             if recreate_on_mismatch:
                 log.warning(str(e))
@@ -218,15 +216,15 @@ def setup_collection(
             else:
                 raise
 
-    log.info("  Creating payload indexes (idempotent)…")
+    log.info("Creating payload indexes...")
     _create_payload_indexes(client, collection_name)
+    log.info(f"setup_collection complete for '{collection_name}'.")
 
-    log.info(f"  setup_collection complete for '{collection_name}'.")
     return client
 
 
 def _create_payload_indexes(client: QdrantClient, collection_name: str) -> None:
-    """Create all payload indexes. Each call is idempotent."""
+    """Create filterable payload indexes. Safe to call multiple times."""
     for field in _KEYWORD_INDEXES:
         try:
             client.create_payload_index(
@@ -236,7 +234,7 @@ def _create_payload_indexes(client: QdrantClient, collection_name: str) -> None:
             )
         except Exception as e:
             if "already exists" not in str(e).lower():
-                log.warning(f"    Could not create KEYWORD index for '{field}': {e}")
+                log.warning(f"Could not create KEYWORD index for '{field}': {e}")
 
     for field in _INTEGER_INDEXES:
         try:
@@ -247,7 +245,7 @@ def _create_payload_indexes(client: QdrantClient, collection_name: str) -> None:
             )
         except Exception as e:
             if "already exists" not in str(e).lower():
-                log.warning(f"    Could not create INTEGER index for '{field}': {e}")
+                log.warning(f"Could not create INTEGER index for '{field}': {e}")
 
     for field in _BOOL_INDEXES:
         try:
@@ -258,27 +256,27 @@ def _create_payload_indexes(client: QdrantClient, collection_name: str) -> None:
             )
         except Exception as e:
             if "already exists" not in str(e).lower():
-                log.warning(f"    Could not create BOOL index for '{field}': {e}")
+                log.warning(f"Could not create BOOL index for '{field}': {e}")
 
     log.info(
-        f"    {len(_KEYWORD_INDEXES)} KEYWORD + {len(_INTEGER_INDEXES)} INTEGER "
+        f"{len(_KEYWORD_INDEXES)} KEYWORD + {len(_INTEGER_INDEXES)} INTEGER "
         f"+ {len(_BOOL_INDEXES)} BOOL payload indexes ensured."
     )
 
 
 def filing_date_to_ts(filing_date: str) -> int | None:
-    """
-    Convert filing_date string to Unix epoch seconds (UTC midnight).
-    """
+    """Parse common filing date formats and return a UTC Unix timestamp."""
     if not filing_date:
         return None
+
     for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y%m%d"):
         try:
             dt = datetime.strptime(filing_date, fmt).replace(tzinfo=timezone.utc)
             return int(dt.timestamp())
         except ValueError:
             continue
-    log.warning(f"  Could not parse filing_date: '{filing_date}'")
+
+    log.warning(f"Could not parse filing_date: '{filing_date}'")
     return None
 
 
@@ -290,16 +288,16 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)-8s %(message)s",
     )
 
-    parser = argparse.ArgumentParser(description="Set up Qdrant collection for RAG pipeline.")
+    parser = argparse.ArgumentParser(description="Set up Qdrant collection for the RAG pipeline.")
     parser.add_argument(
         "--recreate",
         action="store_true",
-        help="Drop and recreate the collection.",
+        help="Delete and recreate the collection.",
     )
     parser.add_argument(
         "--recreate-on-mismatch",
         action="store_true",
-        help="Recreate automatically if an existing collection schema is incompatible.",
+        help="Recreate the collection if the existing schema is incompatible.",
     )
     parser.add_argument(
         "--collection",
@@ -313,6 +311,7 @@ if __name__ == "__main__":
         recreate=args.recreate,
         recreate_on_mismatch=args.recreate_on_mismatch,
     )
+
     info = client.get_collection(args.collection)
     points = getattr(info, "points_count", None) or getattr(info, "vectors_count", 0)
-    log.info(f"Collection info: points_count={points}  status={info.status}")
+    log.info(f"Collection info: points_count={points} status={info.status}")

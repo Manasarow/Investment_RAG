@@ -1,35 +1,5 @@
 """
 Query planner for the investment RAG pipeline.
-
-This revision fixes the retrieval-stage planner bugs from the tracker:
-  #60  Morphology-aware intent signals replace brittle exact-keyword matching
-  #61  Segment enrichment is generic, not Amazon-specific
-  #62  Default fiscal-year resolution is dynamic from the index, not hardcoded
-  #63  Ticker extraction handles one-letter tickers like V and reduces false positives
-  #64  Multi-ticker thematic queries are no longer forced into comparison intent
-  #104 Annual vs quarterly intent is explicitly modelled
-  #105 Fiscal year resolution comes from the live Qdrant index when available
-  #106 Investment-opinion plans preserve ticker filters instead of wiping them
-  #107 Intent is represented as orthogonal dimensions in addition to a legacy label
-  #108 Sector / industry constraints are extracted and passed into filters
-
-BUGFIXES (post-review):
-  BUG-1  fiscal_year values are always stored and compared as int — no more int/str mismatch
-         between extract_fiscal_years(), filters dict, and pipeline verify checks.
-  BUG-2  _available_fiscal_years() no longer uses lru_cache because it queries a live Qdrant
-         index that can be updated between calls. Repeated calls are cheap (payload-only scroll)
-         and correctness matters more than micro-caching here.
-
-The public API remains compatible with the previous planner:
-    plan = plan_retrieval(query)
-
-Returned plan keys still include:
-    query, intent, tickers, fiscal_years, filters,
-    dense_top_k, sparse_top_k, reranker_k, final_k
-
-New keys are added for richer downstream control:
-    dimensions, report_scope, evidence_profile, entity_scope,
-    latest_year, latest_years_by_ticker, retrieval_hints
 """
 
 from __future__ import annotations
@@ -44,9 +14,6 @@ from src.index.qdrant_setup import COLLECTION_NAME, get_client
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Company / ticker aliases
-# ---------------------------------------------------------------------------
 COMPANY_TICKER_MAP: dict[str, str] = {
     "apple": "AAPL",
     "apple inc": "AAPL",
@@ -117,9 +84,8 @@ COMPANY_TICKER_MAP: dict[str, str] = {
 }
 
 ALL_TICKERS = set(COMPANY_TICKER_MAP.values())
-_SINGLE_CHAR_TICKERS = {t for t in ALL_TICKERS if len(t) == 1}
+_SINGLE_CHAR_TICKERS = {ticker for ticker in ALL_TICKERS if len(ticker) == 1}
 
-# Match longer aliases first so "bank of america" wins before "america"-style substrings.
 _ALIAS_PATTERNS: list[tuple[re.Pattern[str], str]] = sorted(
     [
         (
@@ -128,12 +94,9 @@ _ALIAS_PATTERNS: list[tuple[re.Pattern[str], str]] = sorted(
         )
         for alias, ticker in COMPANY_TICKER_MAP.items()
     ],
-    key=lambda x: -len(x[0].pattern),
+    key=lambda item: -len(item[0].pattern),
 )
 
-# ---------------------------------------------------------------------------
-# Sector / industry constraints
-# ---------------------------------------------------------------------------
 SECTOR_ALIASES: dict[str, str] = {
     "technology": "Technology",
     "tech": "Technology",
@@ -168,12 +131,9 @@ SECTOR_ALIASES: dict[str, str] = {
     "basic materials": "Basic Materials",
 }
 
-# ---------------------------------------------------------------------------
-# Morphology-aware signal patterns
-# ---------------------------------------------------------------------------
 NUMERIC_PATTERNS = [
-    re.compile(p, re.I)
-    for p in [
+    re.compile(pattern, re.I)
+    for pattern in [
         r"\brevenue\b",
         r"\bsegment(?:s)?\b",
         r"\bnet\s+income\b",
@@ -197,8 +157,8 @@ NUMERIC_PATTERNS = [
 ]
 
 COMPARISON_PATTERNS = [
-    re.compile(p, re.I)
-    for p in [
+    re.compile(pattern, re.I)
+    for pattern in [
         r"\bcompare\b",
         r"\bcomparison\b",
         r"\bversus\b",
@@ -212,8 +172,8 @@ COMPARISON_PATTERNS = [
 ]
 
 TREND_PATTERNS = [
-    re.compile(p, re.I)
-    for p in [
+    re.compile(pattern, re.I)
+    for pattern in [
         r"\btrend(?:ed|ing)?\b",
         r"\bover\s+time\b",
         r"\bpast\s+\d+\s+(?:fiscal\s+)?years?\b",
@@ -230,8 +190,8 @@ TREND_PATTERNS = [
 ]
 
 THEMATIC_PATTERNS = [
-    re.compile(p, re.I)
-    for p in [
+    re.compile(pattern, re.I)
+    for pattern in [
         r"\bhow\s+are\b",
         r"\bdiscuss(?:ing|ed)?\b",
         r"\btalk(?:ing)?\s+about\b",
@@ -255,8 +215,8 @@ THEMATIC_PATTERNS = [
 ]
 
 INVESTMENT_PATTERNS = [
-    re.compile(p, re.I)
-    for p in [
+    re.compile(pattern, re.I)
+    for pattern in [
         r"\bshould\s+i\s+invest\b",
         r"\bwhich\s+should\s+i\s+invest\b",
         r"\bworth\s+investing\b",
@@ -271,8 +231,8 @@ INVESTMENT_PATTERNS = [
 ]
 
 SEGMENT_PATTERNS = [
-    re.compile(p, re.I)
-    for p in [
+    re.compile(pattern, re.I)
+    for pattern in [
         r"\bsegment(?:s)?\b",
         r"\bbreak\s*down\b",
         r"\bbreakdown\b",
@@ -283,23 +243,22 @@ SEGMENT_PATTERNS = [
 ]
 
 ANNUAL_PATTERNS = [
-    re.compile(p, re.I)
-    for p in [
+    re.compile(pattern, re.I)
+    for pattern in [
         r"\bfy\s*20\d{2}\b",
         r"\bfiscal\s+year\b",
         r"\bannual\b",
         r"\b10-?k\b",
         r"\blast\s+reported\s+(?:fiscal\s+year|fy)\b",
         r"\blatest\s+(?:fiscal\s+year|fy|annual)\b",
-        # "past/last N fiscal years" is a multi-year annual trend — treat as annual scope
         r"\b(?:past|last)\s+\d+\s+fiscal\s+years?\b",
         r"\bover\s+the\s+(?:past|last)\s+\d+\s+(?:fiscal\s+)?years?\b",
     ]
 ]
 
 QUARTERLY_PATTERNS = [
-    re.compile(p, re.I)
-    for p in [
+    re.compile(pattern, re.I)
+    for pattern in [
         r"\bquarter(?:ly)?\b",
         r"\bq[1-4]\b",
         r"\b10-?q\b",
@@ -311,8 +270,8 @@ QUARTERLY_PATTERNS = [
 ]
 
 EARNINGS_RELEASE_PATTERNS = [
-    re.compile(p, re.I)
-    for p in [
+    re.compile(pattern, re.I)
+    for pattern in [
         r"\bearnings\s+release\b",
         r"\bresults\s+of\s+operations\b",
         r"\b8-?k\b",
@@ -321,8 +280,8 @@ EARNINGS_RELEASE_PATTERNS = [
 ]
 
 LATEST_PATTERNS = [
-    re.compile(p, re.I)
-    for p in [
+    re.compile(pattern, re.I)
+    for pattern in [
         r"\blatest\b",
         r"\bmost\s+recent\b",
         r"\bcurrent\b",
@@ -334,38 +293,30 @@ LATEST_PATTERNS = [
 LAST_N_YEARS_RE = re.compile(r"\b(?:last|past)\s+(\d+)\s+(?:fiscal\s+)?years?\b", re.I)
 EXPLICIT_YEAR_RE = re.compile(r"\b(?:FY\s*)?(20\d{2})\b", re.I)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+
 def _contains_any(query: str, patterns: Iterable[re.Pattern[str]]) -> bool:
-    return any(p.search(query) for p in patterns)
+    """Return True if any pattern matches the query."""
+    return any(pattern.search(query) for pattern in patterns)
 
 
 def _extract_sector(query: str) -> Optional[str]:
+    """Extract a normalized sector label from the query."""
     q = query.lower()
-    for alias, sector in sorted(SECTOR_ALIASES.items(), key=lambda kv: -len(kv[0])):
+    for alias, sector in sorted(SECTOR_ALIASES.items(), key=lambda item: -len(item[0])):
         if re.search(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", q, re.I):
             return sector
     return None
 
 
-# BUG-2 FIX: Removed @lru_cache — this function queries a live Qdrant index.
-# Caching would return stale results after index updates for the lifetime of the process.
-# The payload-only scroll is cheap enough to run on each plan call.
 def _available_fiscal_years(
     tickers_key: tuple[str, ...] = (),
     sector: Optional[str] = None,
 ) -> tuple[int, ...]:
-    """
-    Query the live Qdrant index for fiscal years currently available.
-
-    Returns years as a tuple of ints in descending order.
-    Always fetches live — no cache, so index updates are reflected immediately.
-    """
+    """Read available fiscal years from the live Qdrant index."""
     try:
         client = get_client()
-    except Exception as e:
-        log.warning(f"Could not connect to Qdrant for fiscal-year discovery: {e}")
+    except Exception as exc:
+        log.warning("Could not connect to Qdrant for fiscal-year discovery: %s", exc)
         return tuple()
 
     must = []
@@ -390,16 +341,14 @@ def _available_fiscal_years(
             limit=256,
             offset=offset,
         )
-        for rec in records:
-            fy = rec.payload.get("fiscal_year") if rec.payload else None
+        for record in records:
+            fiscal_year = record.payload.get("fiscal_year") if record.payload else None
             try:
-                if fy is not None:
-                    # BUG-1 FIX: always coerce to int so every downstream
-                    # comparison (filters dict, verify checks, etc.) uses the
-                    # same type and int == int comparisons never silently fail.
-                    years.add(int(fy))
+                if fiscal_year is not None:
+                    years.add(int(fiscal_year))
             except (TypeError, ValueError):
                 continue
+
         if offset is None or len(years) >= 8:
             break
 
@@ -407,26 +356,19 @@ def _available_fiscal_years(
 
 
 def _latest_year_for_scope(tickers: list[str], sector: Optional[str]) -> Optional[int]:
+    """Return the latest available fiscal year for the current scope."""
     years = _available_fiscal_years(tuple(sorted(tickers)), sector)
     return years[0] if years else None
 
 
 def extract_tickers(query: str) -> list[str]:
-    """
-    Extract ticker mentions robustly.
-
-    - One-letter tickers like V are detectable when explicitly written as tickers.
-    - False positives are reduced by using exact token boundaries.
-    - Company aliases still resolve in lowercase prose.
-    """
+    """Extract ticker symbols and company aliases from the query."""
     found: set[str] = set()
 
-    # 1) Company / brand aliases in natural language.
     for pattern, ticker in _ALIAS_PATTERNS:
         if pattern.search(query):
             found.add(ticker)
 
-    # 2) Explicit ticker mentions (1-5 uppercase letters, BRK-B style included).
     for token in re.findall(r"\b[A-Z]{1,5}(?:-[A-Z])?\b", query):
         if token in ALL_TICKERS:
             if len(token) == 1 and token not in _SINGLE_CHAR_TICKERS:
@@ -436,33 +378,33 @@ def extract_tickers(query: str) -> list[str]:
     return sorted(found)
 
 
-def extract_fiscal_years(query: str, *, tickers: Optional[list[str]] = None, sector: Optional[str] = None) -> list[int]:
-    """
-    Extract explicit or relative fiscal-year references.
-
-    BUG-1 FIX: All returned years are guaranteed to be int, not str.
-    Relative defaults are resolved from the live index when possible.
-    """
-    # BUG-1 FIX: cast to int explicitly — EXPLICIT_YEAR_RE group(1) is always a str.
-    years = sorted({int(m.group(1)) for m in EXPLICIT_YEAR_RE.finditer(query)}, reverse=True)
+def extract_fiscal_years(
+    query: str,
+    *,
+    tickers: Optional[list[str]] = None,
+    sector: Optional[str] = None,
+) -> list[int]:
+    """Extract explicit or relative fiscal-year references from the query."""
+    years = sorted({int(match.group(1)) for match in EXPLICIT_YEAR_RE.finditer(query)}, reverse=True)
     latest_year = _latest_year_for_scope(tickers or [], sector)
 
-    m = LAST_N_YEARS_RE.search(query)
-    if m:
-        count = max(1, min(10, int(m.group(1))))
+    match = LAST_N_YEARS_RE.search(query)
+    if match:
+        count = max(1, min(10, int(match.group(1))))
         if years:
             base = max(years)
-            # BUG-1 FIX: arithmetic on int base produces int list — no cast needed.
             return sorted([base - i for i in range(count)], reverse=True)
+
         available = list(_available_fiscal_years(tuple(sorted(tickers or [])), sector))
-        return available[:count]  # already ints from _available_fiscal_years
+        return available[:count]
 
     if years:
-        return years  # already ints
+        return years
 
     if _contains_any(query, LATEST_PATTERNS):
         if latest_year is not None:
             return [int(latest_year)]
+
         available = list(_available_fiscal_years(tuple(sorted(tickers or [])), sector))
         if available:
             return [int(available[0])]
@@ -471,6 +413,7 @@ def extract_fiscal_years(query: str, *, tickers: Optional[list[str]] = None, sec
 
 
 def _detect_report_scope(query: str) -> dict:
+    """Infer whether the query prefers annual, quarterly, or event-driven filings."""
     q = query.lower()
 
     annual = _contains_any(q, ANNUAL_PATTERNS)
@@ -504,6 +447,7 @@ def _detect_report_scope(query: str) -> dict:
 
 
 def _detect_evidence_profile(query: str) -> dict:
+    """Infer what kind of evidence the retriever should bias toward."""
     q = query.lower()
     numeric = _contains_any(q, NUMERIC_PATTERNS)
     segment = _contains_any(q, SEGMENT_PATTERNS)
@@ -529,6 +473,7 @@ def _detect_evidence_profile(query: str) -> dict:
 
 
 def _derive_intent(query: str, tickers: list[str], evidence: dict) -> str:
+    """Map query signals into the legacy intent label used downstream."""
     q = query.lower()
     investment = _contains_any(q, INVESTMENT_PATTERNS)
     comparison = _contains_any(q, COMPARISON_PATTERNS)
@@ -538,7 +483,6 @@ def _derive_intent(query: str, tickers: list[str], evidence: dict) -> str:
     if investment:
         return "investment_opinion"
 
-    # Fix #64: thematic cues dominate for sector / narrative synthesis even with many tickers.
     if thematic and (len(tickers) == 0 or len(tickers) > 2 or "across" in q or "sector" in q or "industry" in q):
         return "thematic_synthesis"
 
@@ -555,13 +499,14 @@ def _derive_intent(query: str, tickers: list[str], evidence: dict) -> str:
 
 
 def classify_intent(query: str) -> str:
+    """Public helper for intent-only classification."""
     tickers = extract_tickers(query)
     evidence = _detect_evidence_profile(query)
     return _derive_intent(query, tickers, evidence)
 
 
 def _generic_enrichment(query: str, evidence: dict) -> str:
-    """Generic, finance-safe enrichment. Fixes the Amazon-specific injection bug."""
+    """Append retrieval hints that improve finance-specific recall."""
     additions: list[str] = []
 
     if evidence.get("segment"):
@@ -571,44 +516,37 @@ def _generic_enrichment(query: str, evidence: dict) -> str:
 
     if not additions:
         return query
+
     return f"{query} {' '.join(additions)}"
 
 
 def _latest_years_by_ticker(tickers: list[str]) -> dict[str, int]:
+    """Return the latest indexed fiscal year for each ticker."""
     result: dict[str, int] = {}
     for ticker in tickers:
         years = _available_fiscal_years((ticker,), None)
         if years:
-            result[ticker] = years[0]  # already int
+            result[ticker] = years[0]
     return result
 
 
 def plan_retrieval(query: str) -> dict:
-    """
-    Build the retrieval plan consumed by the retriever.
-
-    BUG-1 FIX: All fiscal_year values in filters are stored as int.
-    BUG-2 FIX: _available_fiscal_years is no longer cached — live index is always queried.
-    """
+    """Build the retrieval plan consumed by the retriever."""
     tickers = extract_tickers(query)
     sector = _extract_sector(query)
     report_scope = _detect_report_scope(query)
     evidence = _detect_evidence_profile(query)
-    # BUG-1 FIX: extract_fiscal_years now always returns list[int]
     fiscal_years = extract_fiscal_years(query, tickers=tickers, sector=sector)
     intent = _derive_intent(query, tickers, evidence)
 
     latest_year = _latest_year_for_scope(tickers, sector)
     latest_years_by_ticker = _latest_years_by_ticker(tickers) if tickers else {}
-
     retrieval_query = _generic_enrichment(query, evidence)
 
     filters: dict = {}
     if tickers:
         filters["ticker"] = tickers if len(tickers) > 1 else tickers[0]
     if fiscal_years:
-        # BUG-1 FIX: fiscal_years are already int; store them as int so that
-        # pipeline.py _years_in_context() comparisons (int == int) always succeed.
         filters["fiscal_year"] = fiscal_years if len(fiscal_years) > 1 else fiscal_years[0]
     if sector:
         filters["sector"] = sector
@@ -619,7 +557,6 @@ def plan_retrieval(query: str) -> dict:
             else report_scope["preferred_sources"][0]
         )
 
-    # Evidence-specific hard filters stay conservative.
     if evidence["preferred_statement_types"] and intent == "single_company_factual":
         filters["statement_type"] = (
             evidence["preferred_statement_types"]
@@ -627,7 +564,6 @@ def plan_retrieval(query: str) -> dict:
             else evidence["preferred_statement_types"][0]
         )
 
-    # Retrieval depth defaults by intent.
     dense_top_k = 50
     sparse_top_k = 50
     reranker_k = 12
@@ -651,7 +587,6 @@ def plan_retrieval(query: str) -> dict:
         if not fiscal_years:
             available = list(_available_fiscal_years(tuple(sorted(tickers)), sector))
             if available:
-                # BUG-1 FIX: available years are already int from _available_fiscal_years
                 filters["fiscal_year"] = available[:3]
     elif intent == "thematic_synthesis":
         dense_top_k = 90
@@ -663,35 +598,32 @@ def plan_retrieval(query: str) -> dict:
         sparse_top_k = 96
         reranker_k = 24
         final_k = max(10, 2 * max(2, len(tickers)))
-        # Fix #106: preserve explicit ticker filters instead of wiping them.
 
+    q_lower = query.lower()
     dimensions = {
         "intent": intent,
         "entity_scope": "multi" if len(tickers) > 1 else ("single" if tickers else "broad"),
         "report_scope": report_scope["scope"],
-        "time_scope": "specific_years" if fiscal_years else ("latest" if _contains_any(query.lower(), LATEST_PATTERNS) else "unspecified"),
-        "comparison": _contains_any(query.lower(), COMPARISON_PATTERNS),
-        "trend": _contains_any(query.lower(), TREND_PATTERNS),
+        "time_scope": "specific_years" if fiscal_years else ("latest" if _contains_any(q_lower, LATEST_PATTERNS) else "unspecified"),
+        "comparison": _contains_any(q_lower, COMPARISON_PATTERNS),
+        "trend": _contains_any(q_lower, TREND_PATTERNS),
         "thematic": evidence["thematic"],
         "numeric": evidence["numeric"],
         "segment": evidence["segment"],
-        "investment": _contains_any(query.lower(), INVESTMENT_PATTERNS),
+        "investment": _contains_any(q_lower, INVESTMENT_PATTERNS),
         "sector": sector,
     }
 
     plan = {
-        # Backward-compatible core keys
         "query": retrieval_query,
         "intent": intent,
         "tickers": tickers,
-        "fiscal_years": fiscal_years,  # list[int]
+        "fiscal_years": fiscal_years,
         "filters": filters,
         "dense_top_k": dense_top_k,
         "sparse_top_k": sparse_top_k,
         "reranker_k": reranker_k,
         "final_k": final_k,
-
-        # New orthogonal dimensions / hints
         "dimensions": dimensions,
         "report_scope": report_scope,
         "evidence_profile": evidence,
@@ -707,7 +639,7 @@ def plan_retrieval(query: str) -> dict:
             "enable_multi_hop": intent in {"cross_company_comparison", "thematic_synthesis", "investment_opinion"} or len(tickers) > 1,
             "require_company_diversity": intent in {"cross_company_comparison", "thematic_synthesis", "investment_opinion"},
             "require_multi_year": intent == "trend_over_time",
-            "latest_bias": _contains_any(query.lower(), LATEST_PATTERNS),
+            "latest_bias": _contains_any(q_lower, LATEST_PATTERNS),
             "numeric_bias": evidence["numeric"],
         },
     }

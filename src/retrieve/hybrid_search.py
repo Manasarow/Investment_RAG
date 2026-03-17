@@ -1,44 +1,5 @@
 """
 Retrieval pipeline for the investment RAG system.
-
-This revision fixes the retrieval-stage bugs from the tracker:
-  #40  Uses BGE-M3 token IDs directly for sparse query vectors; no hash()
-  #41  Context assembly defaults are widened and intent-aware
-  #42  Reranker sees full payload text (already stored by indexer) and richer metadata
-  #43  Dedup no longer collapses table row-groups by text prefix
-  #44  Page-level dedup removed; multiple valid chunks from one page are allowed
-  #45  Missing ticker/year filters can be auto-derived from the query via planner
-  #46  Multi-hop retrieval added for multi-entity / broad synthesis queries
-  #47  RRF is configurable and weighted instead of hardcoded/equal-only
-  #48  Reranker model is configurable; default remains finance-friendly BGE reranker
-  #49  Filter-relaxation fallback recovers from zero-hit filtered searches
-  #50  Qdrant client includes health-check and reconnect logic
-  #91  Numeric queries boost table/row evidence
-  #92  Annual / fiscal-year queries boost annual sources
-  #93  Reranker input now includes period / source metadata to reduce wrong-period wins
-  #94  Metadata bonus scoring layer added after reranking
-  #95  Context assembly enforces diversity across company + year + evidence type
-
-BUGFIXES (post-review):
-  BUG-3  retrieve() no longer silently discards the planner's filters when the caller
-         passes explicit filters={}. The caller in node_retrieve now always passes
-         plan=plan so the full plan object is available. The filters priority logic
-         is clarified: explicit non-None filters take precedence; otherwise plan filters
-         are used. An empty dict {} is treated as "no override" to avoid accidentally
-         clearing plan-derived constraints.
-  BUG-4  _metadata_pre_bonus() was defined but never called. It is now wired into
-         _post_rrf_rescore() which runs immediately after RRF fusion, giving pre-rerank
-         boosting to numeric/annual/source-preferred candidates.
-  BUG-5  _relaxed_filter_variants() crashed with TypeError: unhashable type: 'list'
-         when a filter value was a list (e.g. fiscal_year: [2022, 2023, 2024] for
-         trend queries). Fixed by converting each variant to a hashable key via a
-         recursive helper before adding to the seen set.
-
-Public API remains compatible:
-    retrieve(query, filters=None, dense_top_k=..., sparse_top_k=..., reranker_top_k=..., final_top_k=...)
-
-You may also pass an explicit planner output:
-    retrieve(query, plan=plan_retrieval(query))
 """
 
 from __future__ import annotations
@@ -47,7 +8,6 @@ import copy
 import logging
 import os
 import re
-import time
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -86,31 +46,40 @@ NUMERIC_QUERY_PATTERNS = [
         r"\boperating\s+income\b",
     ]
 ]
-LATEST_PATTERNS = [re.compile(p, re.I) for p in [r"\blatest\b", r"\bmost\s+recent\b", r"\blast\s+reported\b", r"\bcurrent\b"]]
-ANNUAL_PATTERNS = [re.compile(p, re.I) for p in [r"\bfiscal\s+year\b", r"\bannual\b", r"\b10-?k\b", r"\bfy\s*20\d{2}\b"]]
-TREND_PATTERNS = [re.compile(p, re.I) for p in [r"\btrend(?:ed|ing)?\b", r"\bpast\s+\d+\s+(?:fiscal\s+)?years?\b", r"\bover\s+time\b", r"\byoy\b"]]
+LATEST_PATTERNS = [
+    re.compile(p, re.I)
+    for p in [r"\blatest\b", r"\bmost\s+recent\b", r"\blast\s+reported\b", r"\bcurrent\b"]
+]
+ANNUAL_PATTERNS = [
+    re.compile(p, re.I)
+    for p in [r"\bfiscal\s+year\b", r"\bannual\b", r"\b10-?k\b", r"\bfy\s*20\d{2}\b"]
+]
+TREND_PATTERNS = [
+    re.compile(p, re.I)
+    for p in [r"\btrend(?:ed|ing)?\b", r"\bpast\s+\d+\s+(?:fiscal\s+)?years?\b", r"\bover\s+time\b", r"\byoy\b"]
+]
 
 _client: Optional[QdrantClient] = None
 _reranker = None
 
 
-# ---------------------------------------------------------------------------
-# Client / health check
-# ---------------------------------------------------------------------------
 def _new_client() -> QdrantClient:
+    """Create a fresh Qdrant client and verify the connection immediately."""
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=CLIENT_TIMEOUT)
     client.get_collections()
     return client
 
 
 def get_client(force_refresh: bool = False) -> QdrantClient:
+    """Return a healthy Qdrant client, reconnecting if the current one is stale."""
     global _client
+
     if _client is None or force_refresh:
         _client = _new_client()
         return _client
 
     try:
-        _client.get_collections()
+        _client.get_collections()  # Lightweight health check.
         return _client
     except Exception as e:
         log.warning(f"Qdrant health check failed; reconnecting: {e}")
@@ -118,18 +87,15 @@ def get_client(force_refresh: bool = False) -> QdrantClient:
         return _client
 
 
-# ---------------------------------------------------------------------------
-# Planner integration (#45)
-# ---------------------------------------------------------------------------
 def _auto_plan(query: str) -> dict:
+    """Delegate query planning so retrieval can inherit derived filters and hints."""
     from src.generate.query_planner import plan_retrieval
+
     return plan_retrieval(query)
 
 
-# ---------------------------------------------------------------------------
-# Filter builder
-# ---------------------------------------------------------------------------
 def _match_condition(field: str, value: Any) -> Optional[FieldCondition]:
+    """Build a Qdrant filter condition for a single field."""
     if value is None or value == "" or value == []:
         return None
     if isinstance(value, list):
@@ -152,27 +118,30 @@ SUPPORTED_FILTER_FIELDS = (
 
 
 def build_filter(filters: Optional[dict]) -> Optional[Filter]:
+    """Convert the user/planner filter dict into a Qdrant Filter object."""
     if not filters:
         return None
+
     must = []
     for field in SUPPORTED_FILTER_FIELDS:
         cond = _match_condition(field, filters.get(field))
         if cond is not None:
             must.append(cond)
+
     return Filter(must=must) if must else None
 
 
-# ---------------------------------------------------------------------------
-# Query helpers
-# ---------------------------------------------------------------------------
 def _contains_any(query: str, patterns: list[re.Pattern[str]]) -> bool:
+    """Check whether the query matches any pattern in a pattern list."""
     return any(p.search(query) for p in patterns)
 
 
 def _query_flags(query: str, plan: Optional[dict] = None) -> dict:
+    """Derive retrieval flags used for scoring and context assembly."""
     q = query.lower()
     report_scope = (plan or {}).get("report_scope", {})
     evidence = (plan or {}).get("evidence_profile", {})
+
     return {
         "numeric": bool(evidence.get("numeric")) or _contains_any(q, NUMERIC_QUERY_PATTERNS),
         "latest": bool((plan or {}).get("retrieval_hints", {}).get("latest_bias")) or _contains_any(q, LATEST_PATTERNS),
@@ -181,23 +150,24 @@ def _query_flags(query: str, plan: Optional[dict] = None) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Sparse query vector (#40)
-# ---------------------------------------------------------------------------
 def _embed_query(query: str) -> dict:
+    """Run the shared embedder and return dense + sparse query embeddings."""
     return get_embedder().embed_query(query)
 
 
 def _sparse_query_vector(query_emb: dict) -> SparseVector:
+    """Convert sparse token indices and values into Qdrant's SparseVector format."""
     sparse = query_emb["sparse"]
     return SparseVector(indices=list(sparse["indices"]), values=list(sparse["values"]))
 
 
-# ---------------------------------------------------------------------------
-# Stage A: candidate generation
-# ---------------------------------------------------------------------------
-def reciprocal_rank_fusion(result_lists: list[list], *, k: int = RRF_K, weights: Optional[list[float]] = None) -> list[dict]:
-    """Weighted Reciprocal Rank Fusion over Qdrant scored-point lists."""
+def reciprocal_rank_fusion(
+    result_lists: list[list],
+    *,
+    k: int = RRF_K,
+    weights: Optional[list[float]] = None,
+) -> list[dict]:
+    """Fuse multiple ranked lists with weighted Reciprocal Rank Fusion."""
     scores: dict[str, float] = {}
     payloads: dict[str, dict] = {}
 
@@ -217,17 +187,12 @@ def reciprocal_rank_fusion(result_lists: list[list], *, k: int = RRF_K, weights:
         payload = payloads[hit_id]
         payload["_rrf_score"] = scores[hit_id]
         fused.append(payload)
+
     return fused
 
 
 def _metadata_pre_bonus(candidate: dict, flags: dict, plan: Optional[dict]) -> float:
-    """
-    Scoring bonus applied immediately after RRF fusion, before the neural reranker.
-
-    BUG-4 FIX: This function was defined but never called. It is now invoked inside
-    _post_rrf_rescore() so that numeric/annual/source preferences actually influence
-    the candidate ranking passed to the reranker.
-    """
+    """Add lightweight metadata bonuses before neural reranking."""
     bonus = 0.0
     chunk_type = candidate.get("chunk_type", "")
     source_class = candidate.get("source_class", "")
@@ -238,7 +203,14 @@ def _metadata_pre_bonus(candidate: dict, flags: dict, plan: Optional[dict]) -> f
     if flags["numeric"]:
         if chunk_type in {"row", "table", "micro_block"}:
             bonus += 0.12
-        if statement_type in {"segment_table", "income_statement", "balance_sheet", "cash_flow_statement", "debt_table", "eps_table"}:
+        if statement_type in {
+            "segment_table",
+            "income_statement",
+            "balance_sheet",
+            "cash_flow_statement",
+            "debt_table",
+            "eps_table",
+        }:
             bonus += 0.08
 
     if flags["annual"]:
@@ -265,9 +237,7 @@ def _metadata_pre_bonus(candidate: dict, flags: dict, plan: Optional[dict]) -> f
     if periods and flags["trend"]:
         bonus += 0.03
 
-    # Row-label boost: prioritise rows whose label contains the queried metric.
-    # This ensures "Revenue" rows rank above "Cost of revenue" or "Operating income"
-    # rows when the query explicitly asks for revenue, margins, etc.
+    # Boost exact metric rows so the reranker sees more precise candidates first.
     row_label = (candidate.get("row_label") or "").lower()
     if row_label and flags["numeric"]:
         query_lower = "" if plan is None else (plan.get("query", "")).lower()
@@ -286,18 +256,15 @@ def _metadata_pre_bonus(candidate: dict, flags: dict, plan: Optional[dict]) -> f
 
 
 def _post_rrf_rescore(candidates: list[dict], query: str, plan: Optional[dict]) -> list[dict]:
-    """
-    Apply pre-rerank metadata bonuses on top of RRF scores.
-
-    BUG-4 FIX: Now correctly calls _metadata_pre_bonus() with computed flags,
-    so numeric/annual/source hints actually affect pre-rerank candidate ordering.
-    """
+    """Apply metadata bonuses after RRF so stronger candidates reach the reranker."""
     flags = _query_flags(query, plan)
     rescored = []
+
     for cand in candidates:
         cand = dict(cand)
         cand["_score"] = float(cand.get("_rrf_score", 0.0)) + _metadata_pre_bonus(cand, flags, plan)
         rescored.append(cand)
+
     return sorted(rescored, key=lambda x: -x.get("_score", 0.0))
 
 
@@ -310,6 +277,7 @@ def _run_single_search(
     sparse_top_k: int,
     plan: Optional[dict],
 ) -> list[dict]:
+    """Run one hybrid retrieval pass and return fused, rescored candidates."""
     q_emb = _embed_query(query)
     dense_vec = q_emb["dense"]
     sparse_vec = _sparse_query_vector(q_emb)
@@ -339,9 +307,13 @@ def _run_single_search(
         weights=[DENSE_WEIGHT, SPARSE_WEIGHT],
     )
     rescored = _post_rrf_rescore(fused, query, plan)
+
     log.info(
         "Hybrid search: dense=%d sparse=%d fused=%d filters=%s",
-        len(dense_hits), len(sparse_hits), len(rescored), filters,
+        len(dense_hits),
+        len(sparse_hits),
+        len(rescored),
+        filters,
     )
     return rescored
 
@@ -355,6 +327,7 @@ def _multi_hop_candidates(
     dense_top_k: int,
     sparse_top_k: int,
 ) -> list[dict]:
+    """Run per-entity passes plus a global pass for broad or multi-company queries."""
     tickers = plan.get("tickers") or []
     results: list[list[dict]] = []
 
@@ -373,7 +346,7 @@ def _multi_hop_candidates(
                 )
             )
 
-    # Also run a global pass so cross-company / thematic bridges can surface.
+    # Keep one unrestricted pass so cross-company bridges can still surface.
     results.append(
         _run_single_search(
             client=client,
@@ -385,88 +358,66 @@ def _multi_hop_candidates(
         )
     )
 
-    # Merge by point id, keeping max score.
     merged: dict[str, dict] = {}
     for res in results:
         for cand in res:
             pid = str(cand.get("_point_id") or cand.get("chunk_id") or id(cand))
             if pid not in merged or cand.get("_score", 0.0) > merged[pid].get("_score", 0.0):
                 merged[pid] = cand
+
     return sorted(merged.values(), key=lambda x: -x.get("_score", 0.0))
 
 
 def _make_filter_hashable(filters: Optional[dict]) -> Any:
-    """
-    BUG-5 FIX: Convert a filter dict to a hashable key for deduplication.
-
-    The original code did `tuple(sorted(variant.items()))` which raises
-    TypeError when any value is a list (e.g. fiscal_year: [2022, 2023, 2024]).
-    This helper recursively converts lists to tuples so the result is hashable.
-    """
+    """Convert a filter dict into a hashable key so variants can be deduplicated safely."""
     if filters is None:
         return None
-    return tuple(
-        sorted(
-            (k, tuple(v) if isinstance(v, list) else v)
-            for k, v in filters.items()
-        )
-    )
+    return tuple(sorted((k, tuple(v) if isinstance(v, list) else v) for k, v in filters.items()))
 
 
 def _relaxed_filter_variants(filters: Optional[dict], plan: Optional[dict]) -> list[Optional[dict]]:
-    """
-    Generate progressively looser filter sets for zero-hit recovery.
-
-    BUG-5 FIX: Uses _make_filter_hashable() instead of bare tuple(sorted(...items()))
-    so that list-valued filter fields (e.g. fiscal_year=[2022,2023,2024] on trend
-    queries) no longer raise TypeError: unhashable type: 'list'.
-    """
+    """Generate progressively looser filter variants for zero-hit recovery."""
     base = copy.deepcopy(filters or {})
     variants: list[Optional[dict]] = [base]
+
     if not base:
         return variants
 
-    # 1) remove statement-specific constraint
     if "statement_type" in base:
         v = copy.deepcopy(base)
         v.pop("statement_type", None)
         variants.append(v)
 
-    # 2) widen source_class for quarter/event ambiguity
     if "source_class" in base:
         v = copy.deepcopy(base)
         v.pop("source_class", None)
         variants.append(v)
 
-    # 3) remove fiscal year but keep ticker/sector
     if "fiscal_year" in base:
         v = copy.deepcopy(base)
         v.pop("fiscal_year", None)
         variants.append(v)
 
-    # 4) remove sector / industry gates
     if "sector" in base or "industry" in base:
         v = copy.deepcopy(base)
         v.pop("sector", None)
         v.pop("industry", None)
         variants.append(v)
 
-    # 5) remove everything except explicit ticker when present
     if base.get("ticker"):
         variants.append({"ticker": base["ticker"]})
 
-    # 6) full fallback
     variants.append(None)
 
     deduped: list[Optional[dict]] = []
     seen: set = set()
     for variant in variants:
-        # BUG-5 FIX: use _make_filter_hashable() to safely handle list values.
         key = _make_filter_hashable(variant)
         if key in seen:
             continue
         seen.add(key)
         deduped.append(variant)
+
     return deduped
 
 
@@ -478,21 +429,11 @@ def hybrid_search(
     *,
     plan: Optional[dict] = None,
 ) -> list[dict]:
-    """
-    Run dense + sparse retrieval and fuse with weighted RRF.
-
-    BUG-3 FIX: effective_filters resolution clarified.
-    - If the caller passes explicit non-None filters, those take precedence.
-    - An empty dict {} from the caller is treated as "no override" (same as None)
-      to avoid accidentally wiping plan-derived filter constraints on retries.
-    - The plan object is always passed through to _run_single_search / multi-hop
-      so scoring hints are available regardless of how filters were derived.
-    """
+    """Run hybrid retrieval with optional planner-derived filters and fallback relaxation."""
     if plan is None:
         plan = _auto_plan(query)
 
-    # BUG-3 FIX: treat explicit empty dict the same as None — it means the caller
-    # didn't intend to override, so fall back to plan filters.
+    # An empty dict means "no override", so planner filters still apply.
     if filters is not None and len(filters) > 0:
         effective_filters = copy.deepcopy(filters)
     else:
@@ -500,8 +441,8 @@ def hybrid_search(
 
     client = get_client()
     hints = plan.get("retrieval_hints", {})
-
     last_results: list[dict] = []
+
     for variant in _relaxed_filter_variants(effective_filters, plan):
         try:
             if hints.get("enable_multi_hop"):
@@ -523,7 +464,7 @@ def hybrid_search(
                     plan=plan,
                 )
         except Exception:
-            # Reconnect once if query path trips on a stale client.
+            # Retry once with a refreshed client if the connection went stale.
             client = get_client(force_refresh=True)
             results = _run_single_search(
                 client=client,
@@ -543,25 +484,22 @@ def hybrid_search(
     return last_results
 
 
-# ---------------------------------------------------------------------------
-# Stage B: reranking
-# ---------------------------------------------------------------------------
 def get_reranker():
+    """Load the neural reranker once and reuse it across requests."""
     global _reranker
+
     if _reranker is None:
         from FlagEmbedding import FlagReranker
 
         log.info("Loading reranker: %s", RERANKER_MODEL)
         _reranker = FlagReranker(RERANKER_MODEL, use_fp16=RERANKER_USE_FP16)
         log.info("Reranker loaded.")
+
     return _reranker
 
 
 def _reranker_text(candidate: dict) -> str:
-    """
-    Give the reranker the text plus the metadata that disambiguates period/source.
-    This addresses wrong-period wins on semantically similar passages.
-    """
+    """Build reranker input using both chunk text and disambiguating metadata."""
     prefix_parts = [
         candidate.get("ticker", ""),
         candidate.get("source_class") or candidate.get("form_type", ""),
@@ -579,6 +517,7 @@ def _reranker_text(candidate: dict) -> str:
 
 
 def _metadata_post_bonus(candidate: dict, query: str, plan: Optional[dict]) -> float:
+    """Add metadata-aware bonuses after reranking to break close semantic ties."""
     flags = _query_flags(query, plan)
     hints = (plan or {}).get("retrieval_hints", {})
     bonus = 0.0
@@ -596,6 +535,7 @@ def _metadata_post_bonus(candidate: dict, query: str, plan: Optional[dict]) -> f
 
     if flags["annual"] and source_class == "10-K":
         bonus += 0.16
+
     if hints.get("prefer_source_classes") and source_class in hints["prefer_source_classes"]:
         bonus += 0.10
 
@@ -611,13 +551,21 @@ def _metadata_post_bonus(candidate: dict, query: str, plan: Optional[dict]) -> f
     return bonus
 
 
-def rerank(query: str, candidates: list[dict], top_k: int = 10, *, plan: Optional[dict] = None) -> list[dict]:
+def rerank(
+    query: str,
+    candidates: list[dict],
+    top_k: int = 10,
+    *,
+    plan: Optional[dict] = None,
+) -> list[dict]:
+    """Neurally rerank candidates, then apply final metadata-aware score adjustments."""
     if not candidates:
         return []
 
     reranker = get_reranker()
     pairs = [[query, _reranker_text(c)] for c in candidates]
     scores = reranker.compute_score(pairs, normalize=True)
+
     if not hasattr(scores, "__iter__"):
         scores = [scores]
 
@@ -633,12 +581,10 @@ def rerank(query: str, candidates: list[dict], top_k: int = 10, *, plan: Optiona
     return reranked[:top_k]
 
 
-# ---------------------------------------------------------------------------
-# Stage C: context assembly
-# ---------------------------------------------------------------------------
 def _normalized_text_key(chunk: dict) -> str:
+    """Build a stable dedup key from chunk type, citation, and normalized text."""
     text = re.sub(r"\s+", " ", (chunk.get("text") or "").strip().lower())
-    return f"{chunk.get('chunk_type','')}|{chunk.get('citation_key','')}|{text}"
+    return f"{chunk.get('chunk_type', '')}|{chunk.get('citation_key', '')}|{text}"
 
 
 def assemble_context(
@@ -649,13 +595,7 @@ def assemble_context(
     *,
     plan: Optional[dict] = None,
 ) -> list[dict]:
-    """
-    Deduplicate with provenance, then enforce diversity across:
-      - document
-      - page within document (max_per_page cap prevents same-page chunk flooding)
-      - company + year
-      - evidence type
-    """
+    """Select a diverse final context set across docs, pages, years, and evidence types."""
     if not reranked:
         return []
 
@@ -663,17 +603,14 @@ def assemble_context(
     require_company_diversity = hints.get("require_company_diversity", False)
     require_multi_year = hints.get("require_multi_year", False)
 
-    # Bug #41: intent-aware larger defaults.
     if require_company_diversity:
         max_chunks = max(max_chunks, 10)
     if require_multi_year:
         max_chunks = max(max_chunks, 8)
 
     seen_content: set[str] = set()
-    seen_row_labels: set[tuple] = set()  # (doc_id, row_label) for row dedup
-    seen_row_labels: set[tuple[str, str]] = set()  # (doc_id, row_label) for row dedup
+    seen_row_labels: set[tuple[str, str]] = set()
     doc_counts: dict[str, int] = defaultdict(int)
-    # Page-level dedup: prevents multiple row chunks from same page dominating context.
     page_counts: dict[tuple[str, Any], int] = defaultdict(int)
     company_year_counts: dict[tuple[str, Any], int] = defaultdict(int)
     evidence_counts: dict[str, int] = defaultdict(int)
@@ -693,23 +630,18 @@ def assemble_context(
         if doc_counts[doc_id] >= max_per_doc:
             continue
 
-        # Page-level cap: at most max_per_page chunks from any (doc_id, page) pair.
+        # Limit same-page flooding without banning multiple valid chunks from one page.
         if page is not None and page_counts[(doc_id, page)] >= max_per_page:
             continue
 
-        # Row-label dedup: for row-type chunks, prevent the same row_label from
-        # the same document appearing more than once (e.g. 6 "Revenue" rows from
-        # p.41 all scoring highly). Different row_labels (Revenue, Net income,
-        # Gross margin) are all useful; identical labels are pure duplicates.
+        # Deduplicate identical row labels within the same document only.
         row_label = chunk.get("row_label", "") if evidence == "row" else ""
         if row_label and (doc_id, row_label) in seen_row_labels:
             continue
 
-        # Diversity: don't let one company-year dominate unless single-company intent.
         if require_company_diversity and company_year_counts[(ticker, fiscal_year)] >= 2:
             continue
 
-        # Diversity: cap each evidence type a bit so prose/table/row can coexist.
         if evidence_counts[evidence] >= max(2, max_chunks // 2) and len(assembled) < max_chunks - 2:
             continue
 
@@ -726,7 +658,7 @@ def assemble_context(
         if len(assembled) >= max_chunks:
             break
 
-    # If diversity rules were too strict, backfill from the reranked list.
+    # Backfill if diversity constraints left the context too thin.
     if len(assembled) < min(max_chunks, 4):
         for chunk in reranked:
             if len(assembled) >= max_chunks:
@@ -739,14 +671,13 @@ def assemble_context(
 
     log.info(
         "Context assembled: %d chunks | docs=%d | evidence_types=%d",
-        len(assembled), len(doc_counts), len(evidence_counts),
+        len(assembled),
+        len(doc_counts),
+        len(evidence_counts),
     )
     return assembled
 
 
-# ---------------------------------------------------------------------------
-# Full pipeline
-# ---------------------------------------------------------------------------
 def retrieve(
     query: str,
     filters: Optional[dict] = None,
@@ -757,15 +688,7 @@ def retrieve(
     *,
     plan: Optional[dict] = None,
 ) -> list[dict]:
-    """
-    Full 3-stage retrieval pipeline.
-    Returns assembled context chunks ready for generation.
-
-    BUG-3 FIX: plan is now a first-class parameter. When node_retrieve passes
-    plan=plan, the full plan object (with retrieval_hints, fiscal_years, etc.)
-    flows through to hybrid_search, rerank, and assemble_context — so diversity
-    enforcement, multi-year requirements, and scoring hints all work correctly.
-    """
+    """Run the full retrieval pipeline and return final context chunks for generation."""
     if plan is None:
         plan = _auto_plan(query)
 
@@ -776,40 +699,23 @@ def retrieve(
 
     candidates = hybrid_search(
         query=plan.get("query", query),
-        filters=filters,  # BUG-3 FIX: pass filters as-is; hybrid_search handles precedence
+        filters=filters,
         dense_top_k=dense_top_k,
         sparse_top_k=sparse_top_k,
-        plan=plan,  # BUG-3 FIX: always pass the full plan object
+        plan=plan,
     )
 
     reranked = rerank(query, candidates, top_k=reranker_top_k, plan=plan)
     context = assemble_context(reranked, max_chunks=final_top_k, plan=plan)
 
-    # YEAR-DISAMBIGUATION FIX: When the assembled context contains row-type chunks
-    # with no col_header (common for multi-year income statements where three annual
-    # values share the same row_label and page), the LLM cannot determine which value
-    # belongs to which year. Fix: fetch the parent table chunk, which contains the
-    # full retrieval_text with all column headers intact, and prepend it to context.
-    # The parent table chunk is always more useful for year-specific queries than
-    # the individual headerless row chunks.
+    # Inject parent tables when row chunks are ambiguous without column headers.
     context = _inject_parent_table_chunks(context, plan=plan)
 
     return context
 
 
 def _inject_parent_table_chunks(context: list[dict], *, plan: Optional[dict] = None) -> list[dict]:
-    """
-    For row chunks with no col_header, fetch their parent table chunk from Qdrant
-    and prepend it to the context. The parent table chunk contains the full
-    multi-year table text with column headers, allowing the LLM to correctly
-    identify which value belongs to which fiscal year.
-
-    Only fires when:
-    - At least one row chunk in context has an empty col_header
-    - The row chunk has a parent_chunk_id pointing to a table chunk
-    - The parent chunk is not already in context
-    """
-    # Find row chunks that are missing col_header
+    """Prepend parent table chunks for row chunks that lack usable column headers."""
     ambiguous_parent_ids: list[str] = []
     context_chunk_ids: set[str] = {c.get("chunk_id", "") for c in context}
 
@@ -817,7 +723,7 @@ def _inject_parent_table_chunks(context: list[dict], *, plan: Optional[dict] = N
         if chunk.get("chunk_type") != "row":
             continue
         if chunk.get("col_header", "").strip():
-            continue  # col_header present — no ambiguity
+            continue
         parent_id = chunk.get("parent_chunk_id")
         if parent_id and parent_id not in context_chunk_ids and parent_id not in ambiguous_parent_ids:
             ambiguous_parent_ids.append(parent_id)
@@ -827,15 +733,18 @@ def _inject_parent_table_chunks(context: list[dict], *, plan: Optional[dict] = N
 
     try:
         client = get_client()
-        from qdrant_client.models import Filter, FieldCondition, MatchAny
+        from qdrant_client.models import FieldCondition, Filter, MatchAny
+
         results, _ = client.scroll(
             collection_name=COLLECTION_NAME,
-            scroll_filter=Filter(must=[
-                FieldCondition(
-                    key="chunk_id",
-                    match=MatchAny(any=ambiguous_parent_ids),
-                )
-            ]),
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="chunk_id",
+                        match=MatchAny(any=ambiguous_parent_ids),
+                    )
+                ]
+            ),
             with_payload=True,
             with_vectors=False,
             limit=len(ambiguous_parent_ids) * 2,
@@ -856,8 +765,6 @@ def _inject_parent_table_chunks(context: list[dict], *, plan: Optional[dict] = N
                 "Injected %d parent table chunk(s) to resolve year-ambiguous row chunks",
                 len(injected),
             )
-            # Prepend parent table chunks so the LLM sees the structured table
-            # with column headers before the individual row chunks.
             return injected + context
 
     except Exception as e:

@@ -1,17 +1,15 @@
 """
-scripts/evaluate.py — RAG Evaluation Suite
-===========================================
-Sections covered:
-  10.1  120-query labeled test set (single-hop, comparative, thematic)
-  10.2  Retriever metrics: Recall@k, Precision@k, F1@k, MRR, nDCG@k
-  10.3  Generator metrics (RAGAS + faithfulness proxy)
-  10.4  Citation accuracy
-  10.5  Ablation study: 8 pipeline variants
+Evaluate the RAG pipeline on a labeled test set.
 
-Usage
------
-  python scripts/evaluate.py --output results/           # full run
-  python scripts/evaluate.py --output results/ --quick   # 5 per bucket (~15 queries)
+Supports:
+- Retriever metrics
+- Generator metrics
+- Citation metrics
+- Ablation study
+
+Usage:
+  python scripts/evaluate.py --output results/
+  python scripts/evaluate.py --output results/ --quick
   python scripts/evaluate.py --output results/ --section retriever
   python scripts/evaluate.py --output results/ --section ablation
   python scripts/evaluate.py --output results/ --save-testset-only
@@ -32,34 +30,28 @@ from typing import Any, Optional
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Load .env before any pipeline imports so API keys are available
-# ---------------------------------------------------------------------------
 try:
     from dotenv import load_dotenv
-    # Walk up from scripts/ to find the .env at project root
+
+    # Load environment variables before importing pipeline modules.
     _env_path = Path(__file__).resolve().parent.parent / ".env"
     if _env_path.exists():
-        load_dotenv(_env_path, override=False)  # override=False: system env takes precedence
+        load_dotenv(_env_path, override=False)
     else:
-        load_dotenv(override=False)  # search CWD and parents
+        load_dotenv(override=False)
 except ImportError:
-    pass  # python-dotenv not installed — rely on system env vars
+    pass
 
-# ---------------------------------------------------------------------------
-# Progress display — prints a live status bar to stdout
-# ---------------------------------------------------------------------------
 
 def _bar(done: int, total: int, width: int = 30) -> str:
+    """Return a simple progress bar string."""
     filled = int(width * done / total) if total else 0
     return f"[{'█' * filled}{'░' * (width - filled)}] {done}/{total}"
 
 
 class Progress:
-    """
-    Simple single-line progress display that overwrites itself on each update.
-    Falls back to plain log lines if the terminal doesn't support \r.
-    """
+    """Single-line progress display for CLI runs."""
+
     def __init__(self, total: int, label: str = ""):
         self.total = total
         self.label = label
@@ -69,14 +61,16 @@ class Progress:
         self._last_line_len = 0
 
     def _elapsed(self) -> str:
+        """Return elapsed time since start."""
         s = int(time.time() - self.start)
         return f"{s // 60}m{s % 60:02d}s"
 
     def _eta(self) -> str:
+        """Estimate remaining time based on current progress."""
         if self.done == 0:
             return "??:??"
         elapsed = time.time() - self.start
-        if elapsed < 0.01:   # avoid division by zero on instant completions
+        if elapsed < 0.01:
             return "??:??"
         rate = self.done / elapsed
         remaining = (self.total - self.done) / rate
@@ -84,6 +78,7 @@ class Progress:
         return f"{m}m{s:02d}s"
 
     def update(self, msg: str = "") -> None:
+        """Advance progress by one step and refresh the display."""
         self.done += 1
         pct = 100 * self.done // self.total
         line = (
@@ -91,9 +86,9 @@ class Progress:
             f"{pct}%  elapsed {self._elapsed()}  eta {self._eta()}"
         )
         if msg:
-            line += f"  — {msg[:60]}"
+            line += f"  {msg[:60]}"
+
         if self._tty:
-            # overwrite current line
             clear = " " * self._last_line_len
             sys.stdout.write(f"\r{clear}\r{line}")
             sys.stdout.flush()
@@ -102,6 +97,7 @@ class Progress:
             print(line, flush=True)
 
     def done_msg(self, msg: str = "") -> None:
+        """Print a final completion message."""
         line = f"  ✓ {self.label} complete  {self._elapsed()}  {msg}"
         if self._tty:
             clear = " " * self._last_line_len
@@ -112,41 +108,37 @@ class Progress:
 
 
 def _section_header(title: str) -> None:
+    """Print a section title for CLI output."""
     print(f"\n{'─' * 60}", flush=True)
     print(f"  {title}", flush=True)
     print(f"{'─' * 60}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Logging — quieten noisy third-party loggers so progress bar is readable
-# ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.WARNING,           # suppress INFO from httpx, qdrant, etc.
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     datefmt="%H:%M:%S",
-    stream=sys.stderr,               # progress goes to stdout, logs to stderr
+    stream=sys.stderr,
 )
 log = logging.getLogger("evaluate")
-log.setLevel(logging.INFO)           # keep our own logger at INFO
+log.setLevel(logging.INFO)
 
-# Silence the noisiest third-party loggers explicitly
-for _noisy in ("httpx", "httpcore", "qdrant_client", "src.generate.query_planner",
-               "src.retrieve.hybrid_search", "src.index.embedder"):
+for _noisy in (
+    "httpx",
+    "httpcore",
+    "qdrant_client",
+    "src.generate.query_planner",
+    "src.retrieve.hybrid_search",
+    "src.index.embedder",
+):
     logging.getLogger(_noisy).setLevel(logging.ERROR)
 
-# ---------------------------------------------------------------------------
-# Fiscal-year cache — avoids thousands of Qdrant scroll calls
-# ---------------------------------------------------------------------------
+
 _FY_CACHE: dict[str, list[int]] = {}
 
 
 def _patch_fy_cache() -> None:
-    """
-    Monkey-patch query_planner._available_fiscal_years to use an in-process
-    cache so that repeated calls during ablation don't each hit Qdrant.
-    The cache is populated on the first call per (tickers, sector) key and
-    reused for the rest of the evaluation run.
-    """
+    """Cache fiscal year lookups to reduce repeated Qdrant calls."""
     try:
         import src.generate.query_planner as qp
 
@@ -159,7 +151,7 @@ def _patch_fy_cache() -> None:
             return _FY_CACHE[key]
 
         qp._available_fiscal_years = _cached
-        log.info("FY cache patch applied — Qdrant scroll calls will be deduplicated")
+        log.info("Applied fiscal year cache patch")
     except Exception as e:
         log.warning("Could not patch FY cache: %s", e)
 
@@ -1643,11 +1635,8 @@ TEST_SET: list[dict] = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# 10.2  RETRIEVER METRICS
-# ---------------------------------------------------------------------------
-
 def recall_at_k(retrieved_pages: list[int], gold_pages: list[int], k: int) -> float:
+    """Compute recall@k over retrieved page numbers."""
     if not gold_pages:
         return 1.0
     hits = sum(1 for p in gold_pages if p in retrieved_pages[:k])
@@ -1655,6 +1644,7 @@ def recall_at_k(retrieved_pages: list[int], gold_pages: list[int], k: int) -> fl
 
 
 def precision_at_k(retrieved_pages: list[int], gold_pages: list[int], k: int) -> float:
+    """Compute precision@k over retrieved page numbers."""
     top_k = retrieved_pages[:k]
     if not top_k:
         return 0.0
@@ -1662,12 +1652,14 @@ def precision_at_k(retrieved_pages: list[int], gold_pages: list[int], k: int) ->
 
 
 def f1_at_k(retrieved_pages: list[int], gold_pages: list[int], k: int) -> float:
+    """Compute F1@k from precision@k and recall@k."""
     r = recall_at_k(retrieved_pages, gold_pages, k)
     p = precision_at_k(retrieved_pages, gold_pages, k)
     return 2 * r * p / (r + p) if (r + p) else 0.0
 
 
 def mrr(retrieved_pages: list[int], gold_pages: list[int]) -> float:
+    """Compute mean reciprocal rank for the first relevant page."""
     for i, p in enumerate(retrieved_pages, 1):
         if p in gold_pages:
             return 1.0 / i
@@ -1675,13 +1667,19 @@ def mrr(retrieved_pages: list[int], gold_pages: list[int]) -> float:
 
 
 def ndcg_at_k(retrieved_pages: list[int], gold_pages: list[int], k: int) -> float:
+    """Compute nDCG@k for ranked retrieved pages."""
     gold_set = set(gold_pages)
-    dcg = sum(1.0 / math.log2(i + 2) for i, p in enumerate(retrieved_pages[:k]) if p in gold_set)
+    dcg = sum(
+        1.0 / math.log2(i + 2)
+        for i, p in enumerate(retrieved_pages[:k])
+        if p in gold_set
+    )
     ideal = sum(1.0 / math.log2(i + 2) for i in range(min(len(gold_set), k)))
     return dcg / ideal if ideal else 0.0
 
 
 def compute_retriever_metrics(results: list[dict]) -> dict:
+    """Aggregate retriever metrics across all results."""
     ks = [5, 10, 20]
     agg: dict[str, list[float]] = {f"recall@{k}": [] for k in ks}
     agg.update({f"precision@{k}": [] for k in ks})
@@ -1702,48 +1700,44 @@ def compute_retriever_metrics(results: list[dict]) -> dict:
     return {k: float(np.mean(v)) if v else 0.0 for k, v in agg.items()}
 
 
-# ---------------------------------------------------------------------------
-# 10.3  GENERATOR METRICS
-# ---------------------------------------------------------------------------
-
 def _answer_contains_gold(answer: str, gold: str, alts: list[str]) -> bool:
+    """Check whether the generated answer contains the gold answer or an allowed variant."""
     al = answer.lower()
     return any(g.lower() in al for g in [gold] + (alts or []))
 
 
 def compute_generator_metrics(results: list[dict]) -> dict:
+    """Aggregate answer correctness, faithfulness proxy, and abstention rate."""
     correctness, faithfulness, abstentions = [], [], []
 
     for r in results:
         answer = r.get("answer", "")
         hallucinated = r.get("hallucinated_numbers", [])
         is_abstention = answer.strip().startswith("Insufficient evidence")
+
         abstentions.append(float(is_abstention))
         faithfulness.append(1.0 if (is_abstention or not hallucinated) else 0.0)
+
         if is_abstention:
             correctness.append(0.0)
         else:
-            correctness.append(1.0 if _answer_contains_gold(
-                answer, r.get("gold_answer", ""), r.get("gold_alternatives", [])) else 0.0)
+            correctness.append(
+                1.0
+                if _answer_contains_gold(
+                    answer,
+                    r.get("gold_answer", ""),
+                    r.get("gold_alternatives", []),
+                )
+                else 0.0
+            )
 
-    metrics = {
+    return {
         "answer_correctness": float(np.mean(correctness)),
         "faithfulness_proxy": float(np.mean(faithfulness)),
         "abstention_rate": float(np.mean(abstentions)),
         "n": len(results),
     }
 
-    # NOTE: RAGAS disabled due to async/sync client incompatibility with the
-    # installed version. Proxy metrics above (faithfulness_proxy,
-    # answer_correctness) are used instead and are sufficient for the rubric.
-    # To re-enable: pip install --upgrade ragas>=1.0 datasets
-
-    return metrics
-
-
-# ---------------------------------------------------------------------------
-# 10.4  CITATION ACCURACY
-# ---------------------------------------------------------------------------
 
 _CITE_RE = re.compile(
     r"\[(?:[A-Z][A-Z0-9\-]*)\s+(?:[A-Za-z0-9\-\/]+)\s+FY\d{4},\s*pp?\.?\s*(\d+)"
@@ -1753,6 +1747,7 @@ _CITE_RE = re.compile(
 
 
 def _cited_pages(answer: str) -> list[int]:
+    """Extract cited page numbers from the generated answer."""
     pages = []
     for m in _CITE_RE.finditer(answer):
         pages.append(int(m.group(1)))
@@ -1762,58 +1757,51 @@ def _cited_pages(answer: str) -> list[int]:
 
 
 def citation_accuracy(results: list[dict]) -> float:
+    """Measure how often the answer cites at least one required page."""
     answerable = [r for r in results if not r.get("answer", "").startswith("Insufficient")]
     if not answerable:
         return 0.0
+
     hits = sum(
-        1 for r in answerable
-        if not r.get("required_pages") or
-        any(p in r["required_pages"] for p in _cited_pages(r.get("answer", "")))
+        1
+        for r in answerable
+        if not r.get("required_pages")
+        or any(p in r["required_pages"] for p in _cited_pages(r.get("answer", "")))
     )
     return hits / len(answerable)
 
 
 def citation_match_rate(results: list[dict]) -> float:
+    """Measure how many parsed citations matched retrieved source metadata."""
     all_cites = [c for r in results for c in r.get("citations", [])]
     if not all_cites:
         return 0.0
     return sum(1 for c in all_cites if c.get("matched")) / len(all_cites)
 
 
-# ---------------------------------------------------------------------------
-# 10.5  ABLATION VARIANTS
-# ---------------------------------------------------------------------------
-
 ABLATION_VARIANTS = [
-    {"name": "LLM-only (no retrieval)",         "dense": False, "sparse": False, "reranker": False, "verifier": False},
-    {"name": "Dense-only retrieval",             "dense": True,  "sparse": False, "reranker": False, "verifier": False},
-    {"name": "Sparse-only retrieval",            "dense": False, "sparse": True,  "reranker": False, "verifier": False},
-    {"name": "Hybrid (dense + sparse)",          "dense": True,  "sparse": True,  "reranker": False, "verifier": False},
-    {"name": "Hybrid + Reranker",                "dense": True,  "sparse": True,  "reranker": True,  "verifier": False},
-    {"name": "Hybrid + Reranker + Verifier",     "dense": True,  "sparse": True,  "reranker": True,  "verifier": True},
-    {"name": "Fixed chunking (512 tokens)",      "dense": True,  "sparse": True,  "reranker": True,  "verifier": True,  "note": "manual"},
-    {"name": "Hierarchical + table-aware",       "dense": True,  "sparse": True,  "reranker": True,  "verifier": True,  "note": "manual"},
+    {"name": "LLM-only (no retrieval)", "dense": False, "sparse": False, "reranker": False, "verifier": False},
+    {"name": "Dense-only retrieval", "dense": True, "sparse": False, "reranker": False, "verifier": False},
+    {"name": "Sparse-only retrieval", "dense": False, "sparse": True, "reranker": False, "verifier": False},
+    {"name": "Hybrid (dense + sparse)", "dense": True, "sparse": True, "reranker": False, "verifier": False},
+    {"name": "Hybrid + Reranker", "dense": True, "sparse": True, "reranker": True, "verifier": False},
+    {"name": "Hybrid + Reranker + Verifier", "dense": True, "sparse": True, "reranker": True, "verifier": True},
+    {"name": "Fixed chunking (512 tokens)", "dense": True, "sparse": True, "reranker": True, "verifier": True, "note": "manual"},
+    {"name": "Hierarchical + table-aware", "dense": True, "sparse": True, "reranker": True, "verifier": True, "note": "manual"},
 ]
 
 
-# ---------------------------------------------------------------------------
-# PIPELINE RUNNER
-# ---------------------------------------------------------------------------
-
 def _run_one(query: str, variant: dict) -> dict:
-    """Run a single query under a given ablation variant config."""
+    """Run one query under a specific ablation configuration."""
     from src.generate.generator import generate
     from src.generate.query_planner import plan_retrieval
-    from src.retrieve.hybrid_search import (
-        hybrid_search, rerank, assemble_context, build_filter,
-    )
+    from src.retrieve.hybrid_search import hybrid_search, rerank, assemble_context
 
-    dense_on  = variant.get("dense", True)
+    dense_on = variant.get("dense", True)
     sparse_on = variant.get("sparse", True)
-    rank_on   = variant.get("reranker", True)
+    rank_on = variant.get("reranker", True)
     verify_on = variant.get("verifier", True)
 
-    # LLM-only baseline
     if not dense_on and not sparse_on:
         res = generate(query=query, context_chunks=[])
         return {
@@ -1827,78 +1815,118 @@ def _run_one(query: str, variant: dict) -> dict:
 
     plan = plan_retrieval(query)
 
-    # Dense-only / sparse-only: use top_k=1 for the disabled arm with near-zero weight
     if dense_on and not sparse_on:
         os.environ["RETRIEVAL_SPARSE_WEIGHT"] = "0.0001"
-        candidates = hybrid_search(query=plan.get("query", query),
-                                   filters=plan.get("filters", {}),
-                                   dense_top_k=plan.get("dense_top_k", 50),
-                                   sparse_top_k=1, plan=plan)
+        candidates = hybrid_search(
+            query=plan.get("query", query),
+            filters=plan.get("filters", {}),
+            dense_top_k=plan.get("dense_top_k", 50),
+            sparse_top_k=1,
+            plan=plan,
+        )
         os.environ["RETRIEVAL_SPARSE_WEIGHT"] = "1.1"
+
     elif sparse_on and not dense_on:
         os.environ["RETRIEVAL_DENSE_WEIGHT"] = "0.0001"
-        candidates = hybrid_search(query=plan.get("query", query),
-                                   filters=plan.get("filters", {}),
-                                   dense_top_k=1,
-                                   sparse_top_k=plan.get("sparse_top_k", 50), plan=plan)
+        candidates = hybrid_search(
+            query=plan.get("query", query),
+            filters=plan.get("filters", {}),
+            dense_top_k=1,
+            sparse_top_k=plan.get("sparse_top_k", 50),
+            plan=plan,
+        )
         os.environ["RETRIEVAL_DENSE_WEIGHT"] = "1.0"
-    else:
-        candidates = hybrid_search(query=plan.get("query", query),
-                                   filters=plan.get("filters", {}),
-                                   dense_top_k=plan.get("dense_top_k", 50),
-                                   sparse_top_k=plan.get("sparse_top_k", 50), plan=plan)
 
-    ranked   = rerank(query, candidates, top_k=plan.get("reranker_k", 12), plan=plan) if rank_on else candidates[:plan.get("reranker_k", 12)]
-    context  = assemble_context(ranked, max_chunks=plan.get("final_k", 8), plan=plan)
+    else:
+        candidates = hybrid_search(
+            query=plan.get("query", query),
+            filters=plan.get("filters", {}),
+            dense_top_k=plan.get("dense_top_k", 50),
+            sparse_top_k=plan.get("sparse_top_k", 50),
+            plan=plan,
+        )
+
+    ranked = (
+        rerank(query, candidates, top_k=plan.get("reranker_k", 12), plan=plan)
+        if rank_on
+        else candidates[:plan.get("reranker_k", 12)]
+    )
+    context = assemble_context(ranked, max_chunks=plan.get("final_k", 8), plan=plan)
 
     if verify_on:
         from src.generate.pipeline import run_query
+
         full = run_query(query)
         return {
             "answer": full.get("answer", ""),
             "citations": full.get("citations", []),
             "hallucinated_numbers": full.get("hallucinated_numbers", []),
-            "retrieved_pages": [int(c.get("page", 0)) for c in full.get("context_used", []) if c.get("page")],
+            "retrieved_pages": [
+                int(c.get("page", 0))
+                for c in full.get("context_used", [])
+                if c.get("page")
+            ],
             "context_chunks": context,
             "verification": full.get("verification", {}),
         }
-    else:
-        res = generate(query=query, context_chunks=context)
-        return {
-            "answer": res["answer"],
-            "citations": res["citations"],
-            "hallucinated_numbers": res["hallucinated_numbers"],
-            "retrieved_pages": [int(c.get("page", 0)) for c in context if c.get("page")],
-            "context_chunks": context,
-            "verification": {},
-        }
+
+    res = generate(query=query, context_chunks=context)
+    return {
+        "answer": res["answer"],
+        "citations": res["citations"],
+        "hallucinated_numbers": res["hallucinated_numbers"],
+        "retrieved_pages": [int(c.get("page", 0)) for c in context if c.get("page")],
+        "context_chunks": context,
+        "verification": {},
+    }
 
 
-def _run_batch(test_cases: list[dict], variant: dict,
-               prog: Optional[Progress] = None) -> list[dict]:
-    """Run all test cases under one variant, collecting results."""
+def _run_batch(
+    test_cases: list[dict],
+    variant: dict,
+    prog: Optional[Progress] = None,
+) -> list[dict]:
+    """Run all test cases for a single ablation variant."""
     results = []
+
     for tc in test_cases:
         try:
             r = _run_one(tc["query"], variant)
         except Exception as e:
             log.warning("Query %s failed (%s): %s", tc["query_id"], variant["name"], e)
-            r = {"answer": "Error", "citations": [], "hallucinated_numbers": [],
-                 "retrieved_pages": [], "context_chunks": [], "verification": {}}
-        r.update({k: tc[k] for k in ("query_id", "query", "bucket",
-                                      "gold_answer", "gold_alternatives",
-                                      "required_pages", "required_docs")})
+            r = {
+                "answer": "Error",
+                "citations": [],
+                "hallucinated_numbers": [],
+                "retrieved_pages": [],
+                "context_chunks": [],
+                "verification": {},
+            }
+
+        r.update(
+            {
+                k: tc[k]
+                for k in (
+                    "query_id",
+                    "query",
+                    "bucket",
+                    "gold_answer",
+                    "gold_alternatives",
+                    "required_pages",
+                    "required_docs",
+                )
+            }
+        )
         results.append(r)
+
         if prog:
             prog.update(tc["query_id"])
+
     return results
 
 
-# ---------------------------------------------------------------------------
-# OUTPUT HELPERS
-# ---------------------------------------------------------------------------
-
 def _format_ablation_table(rows: list[dict]) -> str:
+    """Format ablation metrics as a fixed-width table."""
     h = f"{'Variant':<46} {'Correct':>8} {'Faith':>7} {'R@10':>7} {'nDCG@10':>8} {'CitAcc':>7}"
     sep = "─" * len(h)
     lines = [h, sep]
@@ -1912,6 +1940,7 @@ def _format_ablation_table(rows: list[dict]) -> str:
         if "error" in r:
             lines.append(f"{r['variant']:<46} ERROR: {r['error'][:40]}")
             continue
+
         lines.append(
             f"{r['variant']:<46}"
             f" {_fmt(r.get('answer_correctness'), 8)}"
@@ -1920,39 +1949,56 @@ def _format_ablation_table(rows: list[dict]) -> str:
             f" {_fmt(r.get('ndcg@10'), 8)}"
             f" {_fmt(r.get('citation_accuracy'), 7)}"
         )
+
     return "\n".join(lines)
+
+
 def _write_results_table(summary: dict, path: Path) -> None:
+    """Write a plain-text summary table to disk."""
     lines = ["=" * 65, "EVALUATION RESULTS", "=" * 65, ""]
 
     ret = summary.get("retriever_metrics", {}).get("overall", {})
     if ret:
-        lines += ["10.2 RETRIEVER METRICS", "─" * 40,
-                  f"  Recall@5:      {ret.get('recall@5', 0):.4f}",
-                  f"  Recall@10:     {ret.get('recall@10', 0):.4f}",
-                  f"  Recall@20:     {ret.get('recall@20', 0):.4f}",
-                  f"  Precision@10:  {ret.get('precision@10', 0):.4f}",
-                  f"  F1@10:         {ret.get('f1@10', 0):.4f}",
-                  f"  MRR:           {ret.get('mrr', 0):.4f}",
-                  f"  nDCG@10:       {ret.get('ndcg@10', 0):.4f}", ""]
+        lines += [
+            "10.2 RETRIEVER METRICS",
+            "─" * 40,
+            f"  Recall@5:      {ret.get('recall@5', 0):.4f}",
+            f"  Recall@10:     {ret.get('recall@10', 0):.4f}",
+            f"  Recall@20:     {ret.get('recall@20', 0):.4f}",
+            f"  Precision@10:  {ret.get('precision@10', 0):.4f}",
+            f"  F1@10:         {ret.get('f1@10', 0):.4f}",
+            f"  MRR:           {ret.get('mrr', 0):.4f}",
+            f"  nDCG@10:       {ret.get('ndcg@10', 0):.4f}",
+            "",
+        ]
 
     gen = summary.get("generator_metrics", {}).get("overall", {})
     if gen:
-        lines += ["10.3 GENERATOR METRICS", "─" * 40,
-                  f"  Answer Correctness:  {gen.get('answer_correctness', 0):.4f}",
-                  f"  Faithfulness:        {gen.get('faithfulness_proxy', 0):.4f}",
-                  f"  Abstention Rate:     {gen.get('abstention_rate', 0):.4f}"]
+        lines += [
+            "10.3 GENERATOR METRICS",
+            "─" * 40,
+            f"  Answer Correctness:  {gen.get('answer_correctness', 0):.4f}",
+            f"  Faithfulness:        {gen.get('faithfulness_proxy', 0):.4f}",
+            f"  Abstention Rate:     {gen.get('abstention_rate', 0):.4f}",
+        ]
         if "ragas_faithfulness" in gen:
-            lines += [f"  RAGAS Faithfulness:        {gen['ragas_faithfulness']:.4f}",
-                      f"  RAGAS Answer Correctness:  {gen['ragas_answer_correctness']:.4f}",
-                      f"  RAGAS Context Precision:   {gen['ragas_context_precision']:.4f}",
-                      f"  RAGAS Context Recall:      {gen['ragas_context_recall']:.4f}"]
+            lines += [
+                f"  RAGAS Faithfulness:        {gen['ragas_faithfulness']:.4f}",
+                f"  RAGAS Answer Correctness:  {gen['ragas_answer_correctness']:.4f}",
+                f"  RAGAS Context Precision:   {gen['ragas_context_precision']:.4f}",
+                f"  RAGAS Context Recall:      {gen['ragas_context_recall']:.4f}",
+            ]
         lines.append("")
 
     cit = summary.get("citation_metrics", {})
     if cit:
-        lines += ["10.4 CITATION METRICS", "─" * 40,
-                  f"  Citation Accuracy:   {cit.get('citation_accuracy', 0):.4f}",
-                  f"  Citation Match Rate: {cit.get('citation_match_rate', 0):.4f}", ""]
+        lines += [
+            "10.4 CITATION METRICS",
+            "─" * 40,
+            f"  Citation Accuracy:   {cit.get('citation_accuracy', 0):.4f}",
+            f"  Citation Match Rate: {cit.get('citation_match_rate', 0):.4f}",
+            "",
+        ]
 
     abl = summary.get("ablation_study", [])
     if abl:
@@ -1961,55 +2007,81 @@ def _write_results_table(summary: dict, path: Path) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _write_failure_analysis(results: list[dict], path: Path) -> None:
+def _write_failure_analysis(results: list[dict], path: Path) -> dict:
+    """Write categorized failure cases to disk for analysis."""
     failures: dict[str, list] = {
-        "abstentions": [], "wrong_period": [],
-        "hallucination_blocked": [], "citation_miss": [], "errors": [],
+        "abstentions": [],
+        "wrong_period": [],
+        "hallucination_blocked": [],
+        "citation_miss": [],
+        "errors": [],
     }
+
     for r in results:
         answer = r.get("answer", "")
+
         if "error" in r and r.get("answer") == "Error":
-            failures["errors"].append({"query_id": r["query_id"], "error": r.get("error", "")})
+            failures["errors"].append(
+                {"query_id": r["query_id"], "error": r.get("error", "")}
+            )
             continue
+
         if answer.startswith("Insufficient evidence"):
             failures["abstentions"].append(
-                {"query_id": r["query_id"], "query": r.get("query", ""),
-                 "bucket": r.get("bucket"), "verification": r.get("verification", {})})
+                {
+                    "query_id": r["query_id"],
+                    "query": r.get("query", ""),
+                    "bucket": r.get("bucket"),
+                    "verification": r.get("verification", {}),
+                }
+            )
+
         if not r.get("verification", {}).get("correct_period", True):
             failures["wrong_period"].append(
-                {"query_id": r["query_id"], "query": r.get("query", "")})
+                {"query_id": r["query_id"], "query": r.get("query", "")}
+            )
+
         if r.get("hallucinated_numbers"):
             failures["hallucination_blocked"].append(
-                {"query_id": r["query_id"], "hallucinated": r["hallucinated_numbers"]})
+                {
+                    "query_id": r["query_id"],
+                    "hallucinated": r["hallucinated_numbers"],
+                }
+            )
+
         cited = _cited_pages(answer)
         gold = set(r.get("required_pages", []))
         if gold and not any(p in gold for p in cited) and not answer.startswith("Insufficient"):
             failures["citation_miss"].append(
-                {"query_id": r["query_id"], "cited": cited, "required": list(gold)})
+                {
+                    "query_id": r["query_id"],
+                    "cited": cited,
+                    "required": list(gold),
+                }
+            )
 
     path.write_text(json.dumps(failures, indent=2), encoding="utf-8")
     return failures
 
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
-
-def run_evaluation(test_cases: list[dict], output_dir: Path,
-                   section: Optional[str], quick: bool) -> dict:
+def run_evaluation(
+    test_cases: list[dict],
+    output_dir: Path,
+    section: Optional[str],
+    quick: bool,
+) -> dict:
+    """Run evaluation, save outputs, and return the summary metrics."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Apply FY cache patch before any pipeline imports fire
     _patch_fy_cache()
 
-    # Quick mode: 5 per bucket
     if quick:
         by_bucket: dict[str, list] = {"single_hop": [], "multi_hop": [], "thematic": []}
         for tc in test_cases:
-            b = tc["bucket"]
-            if b in by_bucket and len(by_bucket[b]) < 5:
-                by_bucket[b].append(tc)
-        test_cases = [tc for g in by_bucket.values() for tc in g]
+            bucket = tc["bucket"]
+            if bucket in by_bucket and len(by_bucket[bucket]) < 5:
+                by_bucket[bucket].append(tc)
+        test_cases = [tc for group in by_bucket.values() for tc in group]
 
     total_q = len(test_cases)
     print(f"\n  Evaluation started — {total_q} queries", flush=True)
@@ -2020,36 +2092,52 @@ def run_evaluation(test_cases: list[dict], output_dir: Path,
     summary: dict[str, Any] = {}
     raw_results: list[dict] = []
 
-    # ── Main query run (sections: retriever, generator, citation) ───────────
     if section in (None, "retriever", "generator", "citation"):
         _section_header(f"10.2 / 10.3 / 10.4  Running {total_q} queries")
         prog = Progress(total_q, "Queries")
 
         for tc in test_cases:
             try:
-                r = _run_one(tc["query"], {
-                    "dense": True, "sparse": True, "reranker": True, "verifier": True
-                })
+                r = _run_one(
+                    tc["query"],
+                    {"dense": True, "sparse": True, "reranker": True, "verifier": True},
+                )
             except Exception as e:
                 log.error("Query %s failed: %s", tc["query_id"], e)
-                r = {"answer": "Error", "citations": [], "hallucinated_numbers": [],
-                     "retrieved_pages": [], "context_chunks": [], "verification": {},
-                     "error": str(e)}
-            r.update({k: tc[k] for k in ("query_id", "query", "bucket",
-                                          "gold_answer", "gold_alternatives",
-                                          "required_pages", "required_docs")})
+                r = {
+                    "answer": "Error",
+                    "citations": [],
+                    "hallucinated_numbers": [],
+                    "retrieved_pages": [],
+                    "context_chunks": [],
+                    "verification": {},
+                    "error": str(e),
+                }
+
+            r.update(
+                {
+                    k: tc[k]
+                    for k in (
+                        "query_id",
+                        "query",
+                        "bucket",
+                        "gold_answer",
+                        "gold_alternatives",
+                        "required_pages",
+                        "required_docs",
+                    )
+                }
+            )
             raw_results.append(r)
-            prog.update(f"{tc['query_id']} — {tc['query'][:45]}")
+            prog.update(f"{tc['query_id']} {tc['query'][:45]}")
 
         prog.done_msg(f"{total_q} queries complete")
 
-        # Save raw
         raw_path = output_dir / "raw_results.jsonl"
         with raw_path.open("w", encoding="utf-8") as f:
             for r in raw_results:
                 f.write(json.dumps(r, default=str) + "\n")
 
-        # 10.2 Retriever
         if section in (None, "retriever"):
             _section_header("10.2  Retriever metrics")
             overall_ret = compute_retriever_metrics(raw_results)
@@ -2058,12 +2146,15 @@ def run_evaluation(test_cases: list[dict], output_dir: Path,
                 sub = [r for r in raw_results if r.get("bucket") == b]
                 if sub:
                     by_bucket_ret[b] = compute_retriever_metrics(sub)
-            summary["retriever_metrics"] = {"overall": overall_ret, "by_bucket": by_bucket_ret}
-            print(f"  Recall@10={overall_ret.get('recall@10', 0):.3f}  "
-                  f"MRR={overall_ret.get('mrr', 0):.3f}  "
-                  f"nDCG@10={overall_ret.get('ndcg@10', 0):.3f}", flush=True)
 
-        # 10.3 Generator
+            summary["retriever_metrics"] = {"overall": overall_ret, "by_bucket": by_bucket_ret}
+            print(
+                f"  Recall@10={overall_ret.get('recall@10', 0):.3f}  "
+                f"MRR={overall_ret.get('mrr', 0):.3f}  "
+                f"nDCG@10={overall_ret.get('ndcg@10', 0):.3f}",
+                flush=True,
+            )
+
         if section in (None, "generator"):
             _section_header("10.3  Generator metrics")
             overall_gen = compute_generator_metrics(raw_results)
@@ -2072,33 +2163,41 @@ def run_evaluation(test_cases: list[dict], output_dir: Path,
                 sub = [r for r in raw_results if r.get("bucket") == b]
                 if sub:
                     by_bucket_gen[b] = compute_generator_metrics(sub)
-            summary["generator_metrics"] = {"overall": overall_gen, "by_bucket": by_bucket_gen}
-            print(f"  Correctness={overall_gen.get('answer_correctness', 0):.3f}  "
-                  f"Faithfulness={overall_gen.get('faithfulness_proxy', 0):.3f}  "
-                  f"Abstention={overall_gen.get('abstention_rate', 0):.3f}", flush=True)
 
-        # 10.4 Citation
+            summary["generator_metrics"] = {"overall": overall_gen, "by_bucket": by_bucket_gen}
+            print(
+                f"  Correctness={overall_gen.get('answer_correctness', 0):.3f}  "
+                f"Faithfulness={overall_gen.get('faithfulness_proxy', 0):.3f}  "
+                f"Abstention={overall_gen.get('abstention_rate', 0):.3f}",
+                flush=True,
+            )
+
         if section in (None, "citation"):
             _section_header("10.4  Citation metrics")
             cit_acc = citation_accuracy(raw_results)
             cit_match = citation_match_rate(raw_results)
-            summary["citation_metrics"] = {"citation_accuracy": cit_acc,
-                                            "citation_match_rate": cit_match}
-            print(f"  Citation accuracy={cit_acc:.3f}  Match rate={cit_match:.3f}", flush=True)
+            summary["citation_metrics"] = {
+                "citation_accuracy": cit_acc,
+                "citation_match_rate": cit_match,
+            }
+            print(
+                f"  Citation accuracy={cit_acc:.3f}  Match rate={cit_match:.3f}",
+                flush=True,
+            )
 
-    # ── 10.5 Ablation ────────────────────────────────────────────────────────
     if section in (None, "ablation"):
-        # Use a compact set for ablation: 10 per bucket max to keep it fast
         abl_cases: list[dict] = []
         for b in ("single_hop", "multi_hop", "thematic"):
             abl_cases += [tc for tc in test_cases if tc["bucket"] == b][:10]
 
         n_abl = len(ABLATION_VARIANTS)
-        n_q   = len(abl_cases)
+        n_q = len(abl_cases)
         total_abl = n_abl * n_q
 
-        _section_header(f"10.5  Ablation study — {n_abl} variants × {n_q} queries = {total_abl} calls")
-        print("  Note: 'Fixed chunking' and 'Hierarchical' variants require manual runs", flush=True)
+        _section_header(
+            f"10.5  Ablation study — {n_abl} variants × {n_q} queries = {total_abl} calls"
+        )
+        print("  Manual chunking variants must be run separately", flush=True)
 
         prog_abl = Progress(total_abl, "Ablation")
         ablation_results: list[dict] = []
@@ -2106,70 +2205,98 @@ def run_evaluation(test_cases: list[dict], output_dir: Path,
         for variant in ABLATION_VARIANTS:
             vname = variant["name"]
 
-            # Manual variants can't be run automatically — record placeholder
             if variant.get("note") == "manual":
-                print(f"\n  [{vname}] — requires manual chunker swap, skipping", flush=True)
-                ablation_results.append({
-                    "variant": vname,
-                    "description": "Requires manual chunker configuration — run separately",
-                    "answer_correctness": None, "faithfulness": None,
-                    "recall@10": None, "ndcg@10": None, "citation_accuracy": None,
-                })
+                print(f"\n  [{vname}] requires manual chunker swap, skipping", flush=True)
+                ablation_results.append(
+                    {
+                        "variant": vname,
+                        "description": "Requires manual chunker configuration",
+                        "answer_correctness": None,
+                        "faithfulness": None,
+                        "recall@10": None,
+                        "ndcg@10": None,
+                        "citation_accuracy": None,
+                    }
+                )
                 for _ in abl_cases:
                     prog_abl.update(vname[:20])
                 continue
 
             print(f"\n  Running: {vname}", flush=True)
             v_results = []
+
             for tc in abl_cases:
                 try:
                     r = _run_one(tc["query"], variant)
                 except Exception as e:
                     log.warning("Ablation %s / %s failed: %s", vname, tc["query_id"], e)
-                    r = {"answer": "Error", "citations": [], "hallucinated_numbers": [],
-                         "retrieved_pages": [], "context_chunks": [], "verification": {}}
-                r.update({k: tc[k] for k in ("query_id", "query", "bucket",
-                                              "gold_answer", "gold_alternatives",
-                                              "required_pages", "required_docs")})
+                    r = {
+                        "answer": "Error",
+                        "citations": [],
+                        "hallucinated_numbers": [],
+                        "retrieved_pages": [],
+                        "context_chunks": [],
+                        "verification": {},
+                    }
+
+                r.update(
+                    {
+                        k: tc[k]
+                        for k in (
+                            "query_id",
+                            "query",
+                            "bucket",
+                            "gold_answer",
+                            "gold_alternatives",
+                            "required_pages",
+                            "required_docs",
+                        )
+                    }
+                )
                 v_results.append(r)
                 prog_abl.update(f"{vname[:20]} / {tc['query_id']}")
 
             gen_m = compute_generator_metrics(v_results)
             ret_m = compute_retriever_metrics(v_results)
             cit_a = citation_accuracy(v_results)
-            ablation_results.append({
-                "variant": vname,
-                "n_queries": len(v_results),
-                "answer_correctness": gen_m["answer_correctness"],
-                "faithfulness": gen_m["faithfulness_proxy"],
-                "abstention_rate": gen_m["abstention_rate"],
-                "recall@10": ret_m.get("recall@10", 0.0),
-                "precision@10": ret_m.get("precision@10", 0.0),
-                "ndcg@10": ret_m.get("ndcg@10", 0.0),
-                "mrr": ret_m.get("mrr", 0.0),
-                "citation_accuracy": cit_a,
-            })
+
+            ablation_results.append(
+                {
+                    "variant": vname,
+                    "n_queries": len(v_results),
+                    "answer_correctness": gen_m["answer_correctness"],
+                    "faithfulness": gen_m["faithfulness_proxy"],
+                    "abstention_rate": gen_m["abstention_rate"],
+                    "recall@10": ret_m.get("recall@10", 0.0),
+                    "precision@10": ret_m.get("precision@10", 0.0),
+                    "ndcg@10": ret_m.get("ndcg@10", 0.0),
+                    "mrr": ret_m.get("mrr", 0.0),
+                    "citation_accuracy": cit_a,
+                }
+            )
 
         prog_abl.done_msg("Ablation complete")
         summary["ablation_study"] = ablation_results
         print("\n" + _format_ablation_table(ablation_results), flush=True)
 
-    # ── Write outputs ─────────────────────────────────────────────────────────
     _section_header("Writing results")
 
     summary_path = output_dir / "evaluation_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
-    print(f"  evaluation_summary.json", flush=True)
+    print("  evaluation_summary.json", flush=True)
 
     if raw_results:
         failures = _write_failure_analysis(raw_results, output_dir / "failure_analysis.json")
-        print(f"  failure_analysis.json  "
-              f"(abstentions={len(failures['abstentions'])}  "
-              f"wrong_period={len(failures['wrong_period'])}  "
-              f"citation_miss={len(failures['citation_miss'])})", flush=True)
+        print(
+            f"  failure_analysis.json  "
+            f"(abstentions={len(failures['abstentions'])}  "
+            f"wrong_period={len(failures['wrong_period'])}  "
+            f"citation_miss={len(failures['citation_miss'])})",
+            flush=True,
+        )
 
     _write_results_table(summary, output_dir / "results_table.txt")
-    print(f"  results_table.txt", flush=True)
+    print("  results_table.txt", flush=True)
 
     testset_path = output_dir / "testset.jsonl"
     with testset_path.open("w", encoding="utf-8") as f:
@@ -2181,19 +2308,26 @@ def run_evaluation(test_cases: list[dict], output_dir: Path,
     return summary
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for the evaluation script."""
     p = argparse.ArgumentParser(description="RAG Investment Pipeline Evaluation")
     p.add_argument("--output", default="results/", help="Output directory")
-    p.add_argument("--section", choices=["retriever", "generator", "citation", "ablation"],
-                   default=None, help="Run only one section (default: all)")
-    p.add_argument("--quick", action="store_true",
-                   help="5 queries per bucket (~15 total) for a fast smoke-test")
-    p.add_argument("--save-testset-only", action="store_true",
-                   help="Write testset.jsonl and exit without running any queries")
+    p.add_argument(
+        "--section",
+        choices=["retriever", "generator", "citation", "ablation"],
+        default=None,
+        help="Run only one section",
+    )
+    p.add_argument(
+        "--quick",
+        action="store_true",
+        help="Run 5 queries per bucket for a quick smoke test",
+    )
+    p.add_argument(
+        "--save-testset-only",
+        action="store_true",
+        help="Write testset.jsonl and exit",
+    )
     return p.parse_args()
 
 
